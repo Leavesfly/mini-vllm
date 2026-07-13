@@ -4,7 +4,7 @@ import com.sun.net.httpserver.HttpServer;
 import io.leavesfly.minivllm.core.LLMEngine;
 import io.leavesfly.minivllm.memory.KVCacheManager;
 import io.leavesfly.minivllm.model.ModelConfig;
-import io.leavesfly.minivllm.model.Transformer;
+import io.leavesfly.minivllm.model.TransformerModel;
 import io.leavesfly.minivllm.tokenizer.ByteTokenizer;
 import io.leavesfly.minivllm.tokenizer.SimpleTokenizer;
 import io.leavesfly.minivllm.weights.ModelLoader;
@@ -47,12 +47,14 @@ public final class MiniVllmServer {
         int maxNumSeqs = 8;
         int numBlocks = 1024;
         boolean verbose = true;
+        boolean gpt3 = false;
 
         for (int i = 0; i < args.length; i++) {
             switch (args[i]) {
                 case "--port": port = Integer.parseInt(args[++i]); break;
                 case "--weights": weightsPath = args[++i]; break;
                 case "--random": random = true; break;
+                case "--gpt3": gpt3 = true; break;
                 case "--max-seqs": maxNumSeqs = Integer.parseInt(args[++i]); break;
                 case "--num-blocks": numBlocks = Integer.parseInt(args[++i]); break;
                 case "--quiet": verbose = false; break;
@@ -61,8 +63,9 @@ public final class MiniVllmServer {
         }
 
         // ---------- 2. 加载模型 ----------
-        ModelConfig cfg = ModelConfig.small();
-        Transformer model;
+        // --gpt3：使用 GPT-3 风格小模型（开启交替 dense/稀疏注意力）；否则用 GPT-2 风格 small()
+        ModelConfig cfg = gpt3 ? ModelConfig.gpt3Nano() : ModelConfig.small();
+        TransformerModel model;
         if (weightsPath != null && !random) {
             System.out.println("加载权重: " + weightsPath);
             Map<String, float[]> weights = SafetensorsLoader.load(Path.of(weightsPath));
@@ -96,6 +99,7 @@ public final class MiniVllmServer {
         System.out.println("  端点: POST /v1/chat/completions");
         System.out.println("        GET  /v1/models");
         System.out.println("  配置: " + cfg);
+        System.out.println("  参数量: " + model.numParameters());
         System.out.println("  并发: maxSeqs=" + maxNumSeqs + ", blocks=" + numBlocks);
         System.out.println("==================================================");
         System.out.println("测试命令:");

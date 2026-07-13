@@ -1,7 +1,7 @@
 package io.leavesfly.minivllm.math;
 
 /**
- * LayerNorm —— 层归一化，Transformer 每个 sublayer 前后都会用到。
+ * LayerNorm —— 层归一化，TransformerModel 每个 sublayer 前后都会用到。
  *
  * 学习要点：
  * 1. 对最后一维做归一化：减均值、除标准差，再用可学习参数 gamma(缩放) beta(偏移) 仿射变换。
@@ -65,5 +65,10 @@ public final class LayerNorm {
                 x[off + i] = (x[off + i] - mean) * invStd * gamma[i] + beta[i];
             }
         }
+    }
+
+    /** 参数量（gamma + beta） */
+    public long numParameters() {
+        return (long) gamma.length + beta.length;
     }
 }

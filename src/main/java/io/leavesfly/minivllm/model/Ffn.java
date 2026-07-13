@@ -7,7 +7,7 @@ import io.leavesfly.minivllm.math.Gelu;
  *
  * 学习要点：
  * 1. GPT-2 的 FFN：fc1(dModel→dFfn) → GELU → fc2(dFfn→dModel)。
- * 2. dFfn 通常 = 4·dModel，是 Transformer 参数量的主要来源。
+ * 2. dFfn 通常 = 4·dModel，是 TransformerModel 参数量的主要来源。
  * 3. FFN 对每个 token 独立作用（不同 token 间无交互，那是 attention 的职责）。
  */
 public final class Ffn {
@@ -32,5 +32,10 @@ public final class Ffn {
         float[] h = fc1.forwardBatch(x, seqLen); // [seqLen, dFfn]
         Gelu.applyInPlace(h);                    // 逐元素激活
         return fc2.forwardBatch(h, seqLen);      // [seqLen, dModel]
+    }
+
+    /** 参数量（fc1 + fc2） */
+    public long numParameters() {
+        return fc1.numParameters() + fc2.numParameters();
     }
 }

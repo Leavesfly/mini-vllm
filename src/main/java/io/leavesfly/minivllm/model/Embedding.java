@@ -1,7 +1,7 @@
 package io.leavesfly.minivllm.model;
 
 /**
- * 嵌入层 —— 把 token id 映射为稠密向量，是 Transformer 的输入入口。
+ * 嵌入层 —— 把 token id 映射为稠密向量，是 TransformerModel 的输入入口。
  *
  * 学习要点：
  * 1. 本质是一张查表：weight 形状 [vocabSize, dModel]，第 id 行就是 token id 的向量。
@@ -50,5 +50,31 @@ public final class Embedding {
             logits[i] = s;
         }
         return logits;
+    }
+
+    /**
+     * 批量反向投影：hidden[rows, dModel] -> logits[rows, vocabSize]。
+     * PyTorch 风格整段 forward 时用此方法一次性算出每个位置的词表分布。
+     */
+    public float[] projectToVocabBatch(float[] hidden, int rows) {
+        float[] logits = new float[rows * vocabSize];
+        for (int r = 0; r < rows; r++) {
+            int hOff = r * dModel;
+            int lOff = r * vocabSize;
+            for (int i = 0; i < vocabSize; i++) {
+                int wOff = i * dModel;
+                float s = 0f;
+                for (int d = 0; d < dModel; d++) {
+                    s += hidden[hOff + d] * weight[wOff + d];
+                }
+                logits[lOff + i] = s;
+            }
+        }
+        return logits;
+    }
+
+    /** 参数量（vocabSize * dModel） */
+    public long numParameters() {
+        return (long) weight.length;
     }
 }

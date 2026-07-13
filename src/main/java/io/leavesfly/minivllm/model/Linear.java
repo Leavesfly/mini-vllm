@@ -3,7 +3,7 @@ package io.leavesfly.minivllm.model;
 import io.leavesfly.minivllm.math.Matmul;
 
 /**
- * 线性层 y = x·Wᵀ + b —— Transformer 中最常见的算子（Q/K/V/O 投影、FFN、lm_head 都是它）。
+ * 线性层 y = x·Wᵀ + b —— TransformerModel 中最常见的算子（Q/K/V/O 投影、FFN、lm_head 都是它）。
  *
  * 学习要点：
  * 1. 权重布局与 PyTorch nn.Linear 一致：W 形状 [outFeatures, inFeatures]（行优先），
@@ -58,5 +58,10 @@ public final class Linear {
     /** 无偏置线性层便捷构造 */
     public static Linear of(float[] weight, int inFeatures, int outFeatures) {
         return new Linear(weight, null, inFeatures, outFeatures);
+    }
+
+    /** 参数量（PyTorch: weight.numel() + bias.numel()） */
+    public long numParameters() {
+        return (long) weight.length + (bias == null ? 0L : bias.length);
     }
 }

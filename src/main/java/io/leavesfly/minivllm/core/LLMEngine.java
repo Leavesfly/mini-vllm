@@ -3,7 +3,7 @@ package io.leavesfly.minivllm.core;
 import io.leavesfly.minivllm.memory.BlockTable;
 import io.leavesfly.minivllm.memory.KVCacheManager;
 import io.leavesfly.minivllm.model.ModelConfig;
-import io.leavesfly.minivllm.model.Transformer;
+import io.leavesfly.minivllm.model.TransformerModel;
 import io.leavesfly.minivllm.tokenizer.SimpleTokenizer;
 import io.leavesfly.minivllm.math.Sampler;
 
@@ -30,7 +30,7 @@ import java.util.function.Consumer;
  */
 public final class LLMEngine {
 
-    private final Transformer model;
+    private final TransformerModel model;
     private final KVCacheManager kvMgr;
     private final SimpleTokenizer tokenizer;
     private final Sampler sampler;
@@ -43,7 +43,7 @@ public final class LLMEngine {
     private final AtomicBoolean running = new AtomicBoolean(false);
     private volatile boolean verbose = false;
 
-    public LLMEngine(Transformer model, KVCacheManager kvMgr, SimpleTokenizer tokenizer,
+    public LLMEngine(TransformerModel model, KVCacheManager kvMgr, SimpleTokenizer tokenizer,
                      int maxNumSeqs, int eosToken, long seed) {
         this.model = model;
         this.kvMgr = kvMgr;
@@ -115,9 +115,7 @@ public final class LLMEngine {
             scheduler.waiting().poll(); // 正式取出
             seq.stage = Sequence.Stage.PREFILL;
             // prefill：一次性处理整段 prompt，写入 KV cache，生成第一个 token
-            float[] hidden = model.prefill(seq.promptTokens, kvMgr, seq.blockTables, 0);
-            float[] last = model.lastRow(hidden, promptLen);
-            float[] logits = model.logits(last);
+            float[] logits = model.prefillLogits(seq.promptTokens, kvMgr, seq.blockTables, 0);
             configureSampler(seq);
             int nextToken = sampler.sample(logits);
             seq.outputTokens.add(nextToken);
@@ -146,8 +144,7 @@ public final class LLMEngine {
                 seq.stage = Sequence.Stage.ABORTED; // 显存不足，中止（学习版不做 preemption）
                 continue;
             }
-            float[] hidden = model.decode(lastToken, curIdx, kvMgr, seq.blockTables);
-            float[] logits = model.logits(hidden);
+            float[] logits = model.decodeLogits(lastToken, curIdx, kvMgr, seq.blockTables);
             configureSampler(seq);
             int nextToken = sampler.sample(logits);
             seq.outputTokens.add(nextToken);

@@ -1,19 +1,14 @@
 package io.leavesfly.minivllm.weights;
 
-import io.leavesfly.minivllm.model.Attention;
-import io.leavesfly.minivllm.model.Embedding;
+import io.leavesfly.minivllm.model.*;
 import io.leavesfly.minivllm.math.LayerNorm;
-import io.leavesfly.minivllm.model.Ffn;
-import io.leavesfly.minivllm.model.Linear;
-import io.leavesfly.minivllm.model.ModelConfig;
-import io.leavesfly.minivllm.model.Transformer;
-import io.leavesfly.minivllm.model.TransformerBlock;
+import io.leavesfly.minivllm.model.TransformerModel;
 
 import java.util.Map;
 import java.util.Random;
 
 /**
- * ModelLoader —— 把权重字典组装成 Transformer，或随机初始化一个可跑通的模型。
+ * ModelLoader —— 把权重字典组装成 TransformerModel，或随机初始化一个可跑通的模型。
  *
  * 权重命名约定（nanoGPT 风格，分离的 q/k/v/o 投影）：
  *   wte.weight                 [vocab, d]
@@ -32,15 +27,17 @@ import java.util.Random;
  * 学习要点：
  * 1. 权重即一维 float[]，按行优先 reshape 成矩阵即可，无需复杂张量抽象。
  * 2. LayerNorm 的 gamma 初始化为 1、beta 为 0；Linear 的 bias 初始化为 0——这是标准初始化。
- * 3. randomInit 用 GPT-2 风格的正态(std=0.02)初始化，即便没有权重文件也能跑通整个推理流程（输出虽无意义）。
+ * 3. randomInit 用 GPT-2/GPT-3 风格正态(std=0.02)初始化，残差投影(o_proj/fc2)按 modified init
+ *    缩放到 std=0.02/sqrt(2*nLayer)；即便没有权重文件也能跑通整个推理流程（输出虽无意义）。
+ * 4. GPT-3 开启 useSparseAttention 时，按 cfg.isSparseLayer(i) 逐层装配 dense/sparse 注意力。
  */
 public final class ModelLoader {
 
     private ModelLoader() {
     }
 
-    /** 从 safetensors 加载的权重字典构造 Transformer */
-    public static Transformer load(ModelConfig cfg, Map<String, float[]> weights) {
+    /** 从 safetensors 加载的权重字典构造 TransformerModel */
+    public static TransformerModel load(ModelConfig cfg, Map<String, float[]> weights) {
         Embedding wteE = new Embedding(get(weights, "wte.weight", cfg.vocabSize * cfg.dModel),
                 cfg.vocabSize, cfg.dModel);
         Embedding wpeE = new Embedding(get(weights, "wpe.weight", cfg.maxSeqLen * cfg.dModel),
@@ -55,19 +52,22 @@ public final class ModelLoader {
             Linear k = linear(weights, p + "attn.k_proj", cfg.dModel, cfg.dModel);
             Linear v = linear(weights, p + "attn.v_proj", cfg.dModel, cfg.dModel);
             Linear o = linear(weights, p + "attn.o_proj", cfg.dModel, cfg.dModel);
-            Attention attn = new Attention(cfg, q, k, v, o);
+            // GPT-3 交替：奇数层用局部带状稀疏注意力，偶数层 dense
+            Attention attn = new Attention(cfg, q, k, v, o, cfg.isSparseLayer(i), cfg.sparseWindow);
             Linear fc1 = linear(weights, p + "mlp.fc1", cfg.dModel, cfg.dFfn);
             Linear fc2 = linear(weights, p + "mlp.fc2", cfg.dFfn, cfg.dModel);
             Ffn ffn = new Ffn(fc1, fc2);
             blocks[i] = new TransformerBlock(ln1, ln2, attn, ffn, cfg.dModel);
         }
         LayerNorm lnF = layerNorm(weights, "ln_f", cfg.dModel, cfg.layerNormEps);
-        return new Transformer(cfg, wteE, wpeE, blocks, lnF);
+        return new TransformerModel(cfg, wteE, wpeE, blocks, lnF);
     }
 
     /** 随机初始化（GPT-2 风格 std=0.02），无权重文件时用于跑通流程 */
-    public static Transformer randomInit(ModelConfig cfg) {
+    public static TransformerModel randomInit(ModelConfig cfg) {
         Random rnd = new Random(42L);
+        float baseStd = 0.02f;                       // GPT-2/GPT-3 标准初始化标准差
+        float resStd = cfg.residualInitStd(baseStd); // 残差投影 modified init：0.02/sqrt(2*nLayer)
         Embedding wteE = new Embedding(randN(rnd, cfg.vocabSize * cfg.dModel, 0.02f),
                 cfg.vocabSize, cfg.dModel);
         Embedding wpeE = new Embedding(randN(rnd, cfg.maxSeqLen * cfg.dModel, 0.02f),
@@ -77,18 +77,19 @@ public final class ModelLoader {
         for (int i = 0; i < cfg.nLayer; i++) {
             LayerNorm ln1 = layerNormRand(rnd, cfg.dModel, cfg.layerNormEps);
             LayerNorm ln2 = layerNormRand(rnd, cfg.dModel, cfg.layerNormEps);
-            Linear q = linearRand(rnd, cfg.dModel, cfg.dModel, 0.02f);
-            Linear k = linearRand(rnd, cfg.dModel, cfg.dModel, 0.02f);
-            Linear v = linearRand(rnd, cfg.dModel, cfg.dModel, 0.02f);
-            Linear o = linearRand(rnd, cfg.dModel, cfg.dModel, 0.02f);
-            Attention attn = new Attention(cfg, q, k, v, o);
-            Linear fc1 = linearRand(rnd, cfg.dModel, cfg.dFfn, 0.02f);
-            Linear fc2 = linearRand(rnd, cfg.dFfn, cfg.dModel, 0.02f);
+            Linear q = linearRand(rnd, cfg.dModel, cfg.dModel, baseStd);
+            Linear k = linearRand(rnd, cfg.dModel, cfg.dModel, baseStd);
+            Linear v = linearRand(rnd, cfg.dModel, cfg.dModel, baseStd);
+            Linear o = linearRand(rnd, cfg.dModel, cfg.dModel, resStd); // 残差路径投影（modified init）
+            // GPT-3 交替：奇数层用局部带状稀疏注意力，偶数层 dense
+            Attention attn = new Attention(cfg, q, k, v, o, cfg.isSparseLayer(i), cfg.sparseWindow);
+            Linear fc1 = linearRand(rnd, cfg.dModel, cfg.dFfn, baseStd);
+            Linear fc2 = linearRand(rnd, cfg.dFfn, cfg.dModel, resStd);  // 残差路径投影（modified init）
             Ffn ffn = new Ffn(fc1, fc2);
             blocks[i] = new TransformerBlock(ln1, ln2, attn, ffn, cfg.dModel);
         }
         LayerNorm lnF = layerNormRand(rnd, cfg.dModel, cfg.layerNormEps);
-        return new Transformer(cfg, wteE, wpeE, blocks, lnF);
+        return new TransformerModel(cfg, wteE, wpeE, blocks, lnF);
     }
 
     // ---------- 辅助构造 ----------

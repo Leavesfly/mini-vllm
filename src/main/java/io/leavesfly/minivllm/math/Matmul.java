@@ -1,7 +1,7 @@
 package io.leavesfly.minivllm.math;
 
 /**
- * 矩阵乘法 —— Transformer 中最核心、计算量最大的算子。
+ * 矩阵乘法 —— TransformerModel 中最核心、计算量最大的算子。
  *
  * 学习要点：
  * 1. C[m,n] = A[m,k] · B[k,n]，三重循环是 GEMM 的最朴素实现。

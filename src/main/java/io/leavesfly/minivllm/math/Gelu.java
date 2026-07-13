@@ -6,7 +6,7 @@ package io.leavesfly.minivllm.math;
  * 学习要点：
  * 1. GELU(x) = x · Φ(x)，Φ 是标准正态分布的累积分布函数。
  * 2. 精确版用 erf，近似版用 tanh 多项式。两者数值接近，近似版计算更快。
- * 3. 相比 ReLU，GELU 在 0 附近更平滑，是现代 Transformer 的标配。
+ * 3. 相比 ReLU，GELU 在 0 附近更平滑，是现代 TransformerModel 的标配。
  */
 public final class Gelu {
 
