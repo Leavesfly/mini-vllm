@@ -1,6 +1,7 @@
 package io.leavesfly.minivllm.core;
 
 import io.leavesfly.minivllm.memory.BlockTable;
+import io.leavesfly.minivllm.tokenizer.BpeTokenizer;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -31,13 +32,23 @@ public final class Sequence {
     public final float temperature;
     public final int topK;
     public final float topP;
-    public final int eosToken; // -1 表示无 EOS
+    public final int[] eosTokens; // 空数组表示无 EOS
 
     /** 流式回调：每生成一个 token 解码后触发 */
     public final Consumer<String> onToken;
 
+    /** BPE 分词时的流式增量解码器（由引擎注入，处理跨 token UTF-8 边界） */
+    public volatile BpeTokenizer.IncrementalDecoder incDecoder;
+
     public Sequence(int id, int[] promptTokens, int maxTokens,
                     float temperature, int topK, float topP, int eosToken,
+                    int nLayer, Consumer<String> onToken) {
+        this(id, promptTokens, maxTokens, temperature, topK, topP,
+                eosToken < 0 ? new int[0] : new int[]{eosToken}, nLayer, onToken);
+    }
+
+    public Sequence(int id, int[] promptTokens, int maxTokens,
+                    float temperature, int topK, float topP, int[] eosTokens,
                     int nLayer, Consumer<String> onToken) {
         this.id = id;
         this.promptTokens = promptTokens;
@@ -45,7 +56,7 @@ public final class Sequence {
         this.temperature = temperature;
         this.topK = topK;
         this.topP = topP;
-        this.eosToken = eosToken;
+        this.eosTokens = eosTokens;
         this.onToken = onToken;
         this.blockTables = new BlockTable[nLayer];
         for (int i = 0; i < nLayer; i++) {
@@ -61,9 +72,13 @@ public final class Sequence {
         if (outputTokens.size() >= maxTokens) {
             return true;
         }
-        if (eosToken >= 0 && !outputTokens.isEmpty()
-                && outputTokens.get(outputTokens.size() - 1) == eosToken) {
-            return true;
+        if (!outputTokens.isEmpty()) {
+            int last = outputTokens.get(outputTokens.size() - 1);
+            for (int eos : eosTokens) {
+                if (last == eos) {
+                    return true;
+                }
+            }
         }
         return false;
     }

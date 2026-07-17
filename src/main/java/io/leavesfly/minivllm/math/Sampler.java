@@ -1,5 +1,7 @@
 package io.leavesfly.minivllm.math;
 
+import java.util.Comparator;
+import java.util.PriorityQueue;
 import java.util.Random;
 
 /**
@@ -38,6 +40,12 @@ public final class Sampler {
 
     /**
      * 完整采样流程：temperature → top-k → top-p → 多项采样。
+     *
+     * 性能要点（词表 151936 时必须考虑）：
+     * - 无截断（topK=0 且 topP>=1）时直接全词表多项采样，O(n) 无需排序；
+     * - 有截断时用大小为 k 的最小堆做 top-k 选择，O(n log k)，
+     *   避免对 15 万元素做全排序（原插入排序 O(n²) 在大词表下不可用）。
+     *
      * @return 选中的 token id
      */
     public int sample(float[] logits) {
@@ -47,57 +55,66 @@ public final class Sampler {
         }
 
         float[] probs = Softmax.softmaxWithTemp(logits, temperature);
-        int[] indices = indexSort(probs); // 按概率降序排列的下标
+        int n = probs.length;
+        int k = topK > 0 ? Math.min(topK, n) : n;
 
-        // top-k 裁剪
-        int limit = indices.length;
-        if (topK > 0 && topK < limit) {
-            limit = topK;
+        if (k == n && topP >= 1f) {
+            // 无截断：全词表多项采样
+            float sum = 0f;
+            for (float p : probs) {
+                sum += p;
+            }
+            float r = random.nextFloat() * sum;
+            float cum = 0f;
+            for (int i = 0; i < n; i++) {
+                cum += probs[i];
+                if (r <= cum) {
+                    return i;
+                }
+            }
+            return n - 1; // 浮点兜底
         }
-        // top-p 裁剪：累积概率达到 topP 即止
-        float cum = 0f;
-        int cut = limit;
-        for (int i = 0; i < limit; i++) {
-            cum += probs[indices[i]];
-            if (cum >= topP) {
+
+        // top-k 堆选择（候选按概率降序），再按 top-p 截断
+        int[] cand = topKIndices(probs, k);
+        float sum = 0f;
+        int cut = cand.length;
+        for (int i = 0; i < cand.length; i++) {
+            sum += probs[cand[i]];
+            if (sum >= topP) {
                 cut = i + 1;
                 break;
             }
         }
-        limit = cut;
 
         // 在候选集合内重新归一化并多项采样
-        float sum = 0f;
-        for (int i = 0; i < limit; i++) {
-            sum += probs[indices[i]];
-        }
         float r = random.nextFloat() * sum;
-        cum = 0f;
-        for (int i = 0; i < limit; i++) {
-            cum += probs[indices[i]];
+        float cum = 0f;
+        for (int i = 0; i < cut; i++) {
+            cum += probs[cand[i]];
             if (r <= cum) {
-                return indices[i];
+                return cand[i];
             }
         }
-        return indices[limit - 1]; // 浮点兜底
+        return cand[cut - 1]; // 浮点兜底
     }
 
-    /** 返回按 probs 降序排列的原下标数组（朴素选择，词表不大够用） */
-    private static int[] indexSort(float[] probs) {
-        int n = probs.length;
-        int[] idx = new int[n];
-        for (int i = 0; i < n; i++) idx[i] = i;
-        // 插入排序：词表通常不大，且只需前若干个；学习项目用简单实现
-        for (int i = 1; i < n; i++) {
-            int cur = idx[i];
-            float curP = probs[cur];
-            int j = i - 1;
-            while (j >= 0 && probs[idx[j]] < curP) {
-                idx[j + 1] = idx[j];
-                j--;
+    /** 用大小为 k 的最小堆选出概率最高的 k 个下标，按概率降序返回 */
+    private static int[] topKIndices(float[] probs, int k) {
+        PriorityQueue<Integer> heap = new PriorityQueue<>(k,
+                Comparator.comparingDouble(i -> probs[i]));
+        for (int i = 0; i < probs.length; i++) {
+            if (heap.size() < k) {
+                heap.offer(i);
+            } else if (probs[i] > probs[heap.peek()]) {
+                heap.poll();
+                heap.offer(i);
             }
-            idx[j + 1] = cur;
         }
-        return idx;
+        int[] out = new int[heap.size()];
+        for (int i = out.length - 1; i >= 0; i--) {
+            out[i] = heap.poll(); // 堆顶最小，逆序得降序
+        }
+        return out;
     }
 }

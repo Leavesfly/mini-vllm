@@ -31,7 +31,7 @@ import io.leavesfly.minivllm.memory.KVCacheManager;
  * 4. GPT-3 相对 GPT-2 的唯一架构差异是交替的 dense / locally banded sparse 注意力，
  *    由 ModelConfig.useSparseAttention 控制，逐层在 ModelLoader 里装配。
  */
-public final class TransformerModel {
+public final class TransformerModel implements LlmModel {
 
     private final ModelConfig cfg;
     private final Embedding wte; // 词嵌入 [vocab, d]
@@ -58,6 +58,7 @@ public final class TransformerModel {
         return cfg.vocabSize;
     }
 
+    @Override
     public ModelConfig config() {
         return cfg;
     }
@@ -74,6 +75,7 @@ public final class TransformerModel {
      * @param startIdx 这些 token 在序列中的起始全局下标（前缀共享时 >0）
      * @return [vocabSize] 最后一个位置的 logits（下一个 token 的分布）
      */
+    @Override
     public float[] prefillLogits(int[] tokenIds, KVCacheManager kvMgr, BlockTable[] bts, int startIdx) {
         float[] hidden = prefill(tokenIds, kvMgr, bts, startIdx);
         return logits(lastRow(hidden, tokenIds.length));
@@ -86,6 +88,7 @@ public final class TransformerModel {
      * @param curIdx  当前 token 的全局下标
      * @return [vocabSize] 当前位置的 logits（下一个 token 的分布）
      */
+    @Override
     public float[] decodeLogits(int tokenId, int curIdx, KVCacheManager kvMgr, BlockTable[] bts) {
         return logits(decode(tokenId, curIdx, kvMgr, bts));
     }

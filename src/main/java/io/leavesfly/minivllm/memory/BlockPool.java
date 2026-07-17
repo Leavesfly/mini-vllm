@@ -36,19 +36,21 @@ public final class BlockPool {
         this.blocks = new KVBlock[numBlocks];
         this.freeList = new ArrayDeque<>(numBlocks);
         for (int i = 0; i < numBlocks; i++) {
-            blocks[i] = new KVBlock(i, blockSize, dModel);
-            freeList.add(i);
+            freeList.add(i); // block 数组懒分配：首次 allocate 时才创建，避免启动即占满堆
         }
     }
 
     /**
-     * 分配一个新 block。
+     * 分配一个新 block（首次分配时才创建底层数组——懒分配）。
      * @return block id；若池满返回 -1（调度器应据此暂停接收新请求）
      */
     public int allocate() {
         Integer id = freeList.pollFirst();
         if (id == null) {
             return -1; // 显存不足，由调度器做 preemption/等待
+        }
+        if (blocks[id] == null) {
+            blocks[id] = new KVBlock(id, blockSize, dModel);
         }
         blocks[id].refCount = 1;
         usedBlocks++;

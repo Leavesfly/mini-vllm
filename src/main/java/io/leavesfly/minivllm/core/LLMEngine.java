@@ -2,8 +2,10 @@ package io.leavesfly.minivllm.core;
 
 import io.leavesfly.minivllm.memory.BlockTable;
 import io.leavesfly.minivllm.memory.KVCacheManager;
+import io.leavesfly.minivllm.model.LlmModel;
 import io.leavesfly.minivllm.model.ModelConfig;
 import io.leavesfly.minivllm.model.TransformerModel;
+import io.leavesfly.minivllm.tokenizer.BpeTokenizer;
 import io.leavesfly.minivllm.tokenizer.SimpleTokenizer;
 import io.leavesfly.minivllm.math.Sampler;
 
@@ -30,14 +32,14 @@ import java.util.function.Consumer;
  */
 public final class LLMEngine {
 
-    private final TransformerModel model;
+    private final LlmModel model;
     private final KVCacheManager kvMgr;
     private final SimpleTokenizer tokenizer;
     private final Sampler sampler;
     private final Scheduler scheduler;
     private final ModelConfig cfg;
     private final int nLayer;
-    private final int eosToken;
+    private final int[] eosTokens;
 
     private final AtomicInteger nextId = new AtomicInteger(0);
     private final AtomicBoolean running = new AtomicBoolean(false);
@@ -45,12 +47,18 @@ public final class LLMEngine {
 
     public LLMEngine(TransformerModel model, KVCacheManager kvMgr, SimpleTokenizer tokenizer,
                      int maxNumSeqs, int eosToken, long seed) {
+        this((LlmModel) model, kvMgr, tokenizer, maxNumSeqs,
+                eosToken < 0 ? new int[0] : new int[]{eosToken}, seed);
+    }
+
+    public LLMEngine(LlmModel model, KVCacheManager kvMgr, SimpleTokenizer tokenizer,
+                     int maxNumSeqs, int[] eosTokens, long seed) {
         this.model = model;
         this.kvMgr = kvMgr;
         this.tokenizer = tokenizer;
         this.cfg = model.config();
         this.nLayer = cfg.nLayer;
-        this.eosToken = eosToken;
+        this.eosTokens = eosTokens;
         this.sampler = new Sampler(seed);
         this.scheduler = new Scheduler(maxNumSeqs);
     }
@@ -73,7 +81,11 @@ public final class LLMEngine {
                                Consumer<String> onToken) {
         int[] promptTokens = tokenizer.encode(prompt);
         Sequence seq = new Sequence(nextId.getAndIncrement(), promptTokens, maxTokens,
-                temperature, topK, topP, eosToken, nLayer, onToken);
+                temperature, topK, topP, eosTokens, nLayer, onToken);
+        // BPE 分词时注入增量解码器，避免跨 token 的 UTF-8 截断乱码
+        if (tokenizer instanceof BpeTokenizer) {
+            seq.incDecoder = ((BpeTokenizer) tokenizer).incrementalDecoder();
+        }
         scheduler.add(seq);
         return seq;
     }
@@ -156,6 +168,13 @@ public final class LLMEngine {
     private void sweepFinished() {
         scheduler.running().removeIf(seq -> {
             if (seq.isFinished()) {
+                // 冲刷增量解码器中剩余的字节（不完整的 UTF-8 尾部）
+                if (seq.incDecoder != null && seq.onToken != null) {
+                    String rest = seq.incDecoder.flush();
+                    if (!rest.isEmpty()) {
+                        seq.onToken.accept(rest);
+                    }
+                }
                 for (BlockTable bt : seq.blockTables) {
                     kvMgr.free(bt);
                 }
@@ -173,7 +192,22 @@ public final class LLMEngine {
     }
 
     private void emitToken(Sequence seq, int token) {
-        if (seq.onToken != null) {
+        if (seq.onToken == null) {
+            return;
+        }
+        // EOS / 停止 token 不输出文本（否则 <|im_end|> 等会泄露到响应里，
+        // 并在多轮对话中污染 ChatML 上下文）
+        for (int eos : seq.eosTokens) {
+            if (token == eos) {
+                return;
+            }
+        }
+        if (seq.incDecoder != null) {
+            String piece = seq.incDecoder.accept(token);
+            if (!piece.isEmpty()) {
+                seq.onToken.accept(piece);
+            }
+        } else {
             seq.onToken.accept(tokenizer.decode(new int[]{token}));
         }
     }

@@ -1,0 +1,504 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>mini-vllm · 对话演示</title>
+<style>
+  :root {
+    --bg: #f5f5f7;
+    --card: #ffffff;
+    --border: #e3e3e8;
+    --text: #1d1d1f;
+    --text-2: #86868b;
+    --user-bubble: #3a3a3c;
+    --accent: #4a7c6f;
+    --accent-soft: #eef4f2;
+    --danger: #b34a44;
+    --radius: 14px;
+    --shadow: 0 1px 3px rgba(0,0,0,.06);
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", "Helvetica Neue", sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+  }
+
+  /* ---------- 顶栏 ---------- */
+  header {
+    position: sticky; top: 0; z-index: 10;
+    width: 100%;
+    background: rgba(255,255,255,.82);
+    backdrop-filter: saturate(180%) blur(12px);
+    -webkit-backdrop-filter: saturate(180%) blur(12px);
+    border-bottom: 1px solid var(--border);
+  }
+  .header-inner {
+    max-width: 780px; margin: 0 auto; padding: 12px 20px;
+    display: flex; align-items: center; gap: 10px;
+  }
+  .logo {
+    width: 30px; height: 30px; border-radius: 8px;
+    background: var(--user-bubble);
+    color: #fff; font-size: 13px; font-weight: 600;
+    display: flex; align-items: center; justify-content: center;
+    letter-spacing: .5px;
+  }
+  .title-wrap { flex: 1; min-width: 0; }
+  .title { font-size: 15px; font-weight: 600; }
+  .subtitle { font-size: 12px; color: var(--text-2); }
+  .status {
+    display: flex; align-items: center; gap: 6px;
+    font-size: 12px; color: var(--text-2);
+  }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: #c7c7cc; }
+  .dot.ok { background: #30a46c; }
+  .dot.err { background: var(--danger); }
+
+  /* ---------- 主区域 ---------- */
+  main {
+    width: 100%; max-width: 780px;
+    flex: 1; display: flex; flex-direction: column;
+    padding: 0 20px;
+    min-height: 0;
+  }
+
+  /* 消息列表 */
+  #chat {
+    flex: 1; overflow-y: auto;
+    padding: 20px 2px 12px;
+    display: flex; flex-direction: column; gap: 14px;
+  }
+  .empty {
+    margin: auto; text-align: center; color: var(--text-2);
+    display: flex; flex-direction: column; align-items: center; gap: 10px;
+  }
+  .empty-icon {
+    width: 52px; height: 52px; border-radius: 14px;
+    background: var(--card); border: 1px solid var(--border);
+    display: flex; align-items: center; justify-content: center;
+    font-size: 24px;
+  }
+  .empty h2 { font-size: 17px; font-weight: 600; color: var(--text); }
+  .empty p { font-size: 13px; line-height: 1.6; }
+  .suggestions { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; margin-top: 6px; }
+  .suggestion {
+    font-size: 13px; padding: 7px 13px;
+    background: var(--card); border: 1px solid var(--border); border-radius: 999px;
+    cursor: pointer; transition: background .15s;
+    color: var(--text);
+  }
+  .suggestion:hover { background: var(--accent-soft); border-color: #cfdeda; }
+
+  .msg { display: flex; }
+  .msg.user { justify-content: flex-end; }
+  .bubble {
+    max-width: 82%;
+    padding: 10px 14px;
+    border-radius: var(--radius);
+    font-size: 14.5px; line-height: 1.65;
+    white-space: pre-wrap; word-break: break-word;
+  }
+  .msg.user .bubble {
+    background: var(--user-bubble); color: #fff;
+    border-bottom-right-radius: 4px;
+  }
+  .msg.assistant { flex-direction: column; align-items: flex-start; }
+  .msg.assistant .bubble {
+    background: var(--card); border: 1px solid var(--border);
+    border-bottom-left-radius: 4px;
+    box-shadow: var(--shadow);
+  }
+  .msg.assistant .bubble.streaming::after {
+    content: "▍";
+    color: var(--accent);
+    animation: blink 1s steps(2) infinite;
+  }
+  @keyframes blink { 50% { opacity: 0; } }
+  .meta {
+    font-size: 11.5px; color: var(--text-2);
+    margin: 5px 4px 0;
+  }
+  .msg.error .bubble {
+    background: #fdf3f2; border: 1px solid #f0d9d7; color: var(--danger);
+  }
+
+  /* ---------- 设置面板 ---------- */
+  .panel {
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: var(--radius); box-shadow: var(--shadow);
+    padding: 12px 16px;
+    display: none;
+    margin-bottom: 10px;
+  }
+  .panel.open { display: block; }
+  .panel-grid {
+    display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px;
+  }
+  .field label {
+    display: flex; justify-content: space-between;
+    font-size: 12px; color: var(--text-2); margin-bottom: 6px;
+  }
+  .field label output { color: var(--text); font-variant-numeric: tabular-nums; }
+  .field input[type=range] {
+    width: 100%; accent-color: var(--accent); height: 20px;
+  }
+  .panel-toggle {
+    display: flex; align-items: center; gap: 8px;
+    padding-bottom: 10px; margin-bottom: 4px;
+    border-bottom: 1px solid var(--border);
+  }
+  .switch-label {
+    display: flex; align-items: center; gap: 7px;
+    font-size: 13px; color: var(--text); cursor: pointer;
+  }
+  .switch-label input { accent-color: var(--accent); width: 16px; height: 16px; }
+  .switch-label .desc { color: var(--text-2); font-size: 11.5px; }
+
+  /* ---------- 输入区 ---------- */
+  .composer {
+    padding: 6px 0 18px;
+  }
+  .composer-box {
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: 18px; box-shadow: var(--shadow);
+    display: flex; align-items: flex-end; gap: 8px;
+    padding: 10px 10px 10px 16px;
+  }
+  .composer-box:focus-within { border-color: #c6c6cb; }
+  textarea {
+    flex: 1; border: none; outline: none; resize: none;
+    font: inherit; font-size: 14.5px; line-height: 1.5;
+    max-height: 160px; background: transparent; color: var(--text);
+    padding: 4px 0;
+  }
+  textarea::placeholder { color: var(--text-2); }
+  .btn {
+    border: none; cursor: pointer; font: inherit;
+    border-radius: 12px;
+    transition: opacity .15s, background .15s;
+    flex-shrink: 0;
+  }
+  .btn-send {
+    width: 36px; height: 36px;
+    background: var(--user-bubble); color: #fff;
+    font-size: 16px;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .btn-send:disabled { opacity: .35; cursor: default; }
+  .btn-send.stop { background: var(--danger); }
+  .toolbar {
+    display: flex; align-items: center; gap: 8px;
+    margin-top: 8px; padding: 0 4px;
+  }
+  .btn-text {
+    background: transparent; color: var(--text-2);
+    font-size: 12.5px; padding: 4px 8px; border-radius: 8px;
+  }
+  .btn-text:hover { background: #ececee; color: var(--text); }
+  .toolbar .spacer { flex: 1; }
+  .hint { font-size: 11.5px; color: var(--text-2); }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="header-inner">
+    <div class="logo">mv</div>
+    <div class="title-wrap">
+      <div class="title">mini-vllm 对话演示</div>
+      <div class="subtitle">PagedAttention · Continuous Batching · 纯 Java 推理</div>
+    </div>
+    <div class="status"><span class="dot" id="statusDot"></span><span id="statusText">连接中…</span></div>
+  </div>
+</header>
+
+<main>
+  <div id="chat">
+    <div class="empty" id="emptyState">
+      <div class="empty-icon">💬</div>
+      <h2>与本地模型对话</h2>
+      <p>输入消息开始对话，token 将逐字流式输出。<br>所有推理均在本机由 mini-vllm 引擎完成。</p>
+      <div class="suggestions">
+        <button class="suggestion" data-q="你好，请介绍一下你自己">你好，请介绍一下你自己</button>
+        <button class="suggestion" data-q="用一句话解释什么是注意力机制">用一句话解释什么是注意力机制</button>
+        <button class="suggestion" data-q="写一首关于秋天的小诗">写一首关于秋天的小诗</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="panel" id="settingsPanel">
+    <div class="panel-toggle">
+      <label class="switch-label"><input type="checkbox" id="thinkToggle"> 思考模式
+        <span class="desc">开启后模型先推理再作答（更慢、更长）；默认关闭，直接作答</span>
+      </label>
+    </div>
+    <div class="panel-grid">
+      <div class="field">
+        <label>temperature <output id="tempVal">0.7</output></label>
+        <input type="range" id="temp" min="0" max="2" step="0.05" value="0.7">
+      </div>
+      <div class="field">
+        <label>top_p <output id="topPVal">0.95</output></label>
+        <input type="range" id="topP" min="0" max="1" step="0.05" value="0.95">
+      </div>
+      <div class="field">
+        <label>max_tokens <output id="maxTokVal">512</output></label>
+        <input type="range" id="maxTok" min="16" max="2048" step="16" value="512">
+      </div>
+    </div>
+  </div>
+
+  <div class="composer">
+    <div class="composer-box">
+      <textarea id="input" rows="1" placeholder="输入消息，Enter 发送，Shift+Enter 换行"></textarea>
+      <button class="btn btn-send" id="sendBtn" title="发送">↑</button>
+    </div>
+    <div class="toolbar">
+      <button class="btn btn-text" id="settingsBtn">⚙ 采样参数</button>
+      <button class="btn btn-text" id="clearBtn">清空对话</button>
+      <div class="spacer"></div>
+      <span class="hint">POST /v1/chat/completions · SSE 流式</span>
+    </div>
+  </div>
+</main>
+
+<script>
+(function () {
+  "use strict";
+
+  var chat = document.getElementById("chat");
+  var emptyState = document.getElementById("emptyState");
+  var input = document.getElementById("input");
+  var sendBtn = document.getElementById("sendBtn");
+  var clearBtn = document.getElementById("clearBtn");
+  var settingsBtn = document.getElementById("settingsBtn");
+  var settingsPanel = document.getElementById("settingsPanel");
+  var statusDot = document.getElementById("statusDot");
+  var statusText = document.getElementById("statusText");
+
+  var messages = [];        // 多轮对话历史 {role, content}
+  var generating = false;
+  var abortCtrl = null;
+
+  // ---------- 服务状态检测 ----------
+  function checkHealth() {
+    fetch("/v1/models").then(function (r) {
+      if (!r.ok) throw new Error();
+      return r.json();
+    }).then(function (d) {
+      var name = (d.data && d.data[0] && d.data[0].id) || "mini-vllm";
+      statusDot.className = "dot ok";
+      statusText.textContent = "已连接 · " + name;
+    }).catch(function () {
+      statusDot.className = "dot err";
+      statusText.textContent = "服务不可用";
+    });
+  }
+  checkHealth();
+
+  // ---------- 参数滑块 ----------
+  function bindSlider(id, outId, fmt) {
+    var el = document.getElementById(id), out = document.getElementById(outId);
+    el.addEventListener("input", function () { out.textContent = fmt(el.value); });
+  }
+  bindSlider("temp", "tempVal", function (v) { return Number(v).toFixed(2).replace(/0$/, ""); });
+  bindSlider("topP", "topPVal", function (v) { return Number(v).toFixed(2).replace(/0$/, ""); });
+  bindSlider("maxTok", "maxTokVal", function (v) { return v; });
+
+  settingsBtn.addEventListener("click", function () {
+    settingsPanel.classList.toggle("open");
+  });
+
+  // ---------- 消息渲染 ----------
+  function scrollBottom() { chat.scrollTop = chat.scrollHeight; }
+
+  function hideEmpty() { if (emptyState) emptyState.style.display = "none"; }
+
+  function addMsg(role, text) {
+    hideEmpty();
+    var wrap = document.createElement("div");
+    wrap.className = "msg " + role;
+    var bubble = document.createElement("div");
+    bubble.className = "bubble";
+    bubble.textContent = text;
+    wrap.appendChild(bubble);
+    chat.appendChild(wrap);
+    scrollBottom();
+    return bubble;
+  }
+
+  function addError(text) {
+    hideEmpty();
+    var wrap = document.createElement("div");
+    wrap.className = "msg error";
+    var bubble = document.createElement("div");
+    bubble.className = "bubble";
+    bubble.textContent = text;
+    wrap.appendChild(bubble);
+    chat.appendChild(wrap);
+    scrollBottom();
+  }
+
+  // ---------- 输入框自适应 ----------
+  function autosize() {
+    input.style.height = "auto";
+    input.style.height = Math.min(input.scrollHeight, 160) + "px";
+  }
+  input.addEventListener("input", autosize);
+
+  input.addEventListener("keydown", function (e) {
+    if (e.key === "Enter" && !e.shiftKey && !e.isComposing) {
+      e.preventDefault();
+      send();
+    }
+  });
+
+  // ---------- 发送与流式接收 ----------
+  function setGenerating(on) {
+    generating = on;
+    if (on) {
+      sendBtn.textContent = "■";
+      sendBtn.classList.add("stop");
+      sendBtn.title = "停止生成";
+    } else {
+      sendBtn.textContent = "↑";
+      sendBtn.classList.remove("stop");
+      sendBtn.title = "发送";
+      abortCtrl = null;
+    }
+  }
+
+  sendBtn.addEventListener("click", function () {
+    if (generating) {
+      if (abortCtrl) abortCtrl.abort();
+    } else {
+      send();
+    }
+  });
+
+  clearBtn.addEventListener("click", function () {
+    if (generating && abortCtrl) abortCtrl.abort();
+    messages = [];
+    chat.innerHTML = "";
+    chat.appendChild(emptyState);
+    emptyState.style.display = "";
+    input.focus();
+  });
+
+  document.querySelectorAll(".suggestion").forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      input.value = btn.getAttribute("data-q");
+      autosize();
+      send();
+    });
+  });
+
+  function send() {
+    var text = input.value.trim();
+    if (!text || generating) return;
+
+    input.value = "";
+    autosize();
+
+    messages.push({ role: "user", content: text });
+    addMsg("user", text);
+
+    var bubble = addMsg("assistant", "");
+    bubble.classList.add("streaming");
+
+    var body = {
+      model: "mini-vllm",
+      messages: messages.slice(),
+      stream: true,
+      enable_thinking: document.getElementById("thinkToggle").checked,
+      temperature: parseFloat(document.getElementById("temp").value),
+      top_p: parseFloat(document.getElementById("topP").value),
+      max_tokens: parseInt(document.getElementById("maxTok").value, 10)
+    };
+
+    setGenerating(true);
+    abortCtrl = new AbortController();
+    var t0 = performance.now();
+    var answer = "";
+    var chunks = 0;
+    var stopped = false;
+
+    fetch("/v1/chat/completions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+      signal: abortCtrl.signal
+    }).then(function (resp) {
+      if (!resp.ok || !resp.body) throw new Error("HTTP " + resp.status);
+      var reader = resp.body.pipeThrough(new TextDecoderStream()).getReader();
+      var buf = "";
+
+      function pump() {
+        return reader.read().then(function (r) {
+          if (r.done) return;
+          buf += r.value;
+          var idx;
+          while ((idx = buf.indexOf("\n\n")) >= 0) {
+            var raw = buf.slice(0, idx).trim();
+            buf = buf.slice(idx + 2);
+            if (raw.indexOf("data:") !== 0) continue;
+            var data = raw.slice(5).trim();
+            if (data === "[DONE]") continue;
+            try {
+              var obj = JSON.parse(data);
+              var delta = obj.choices && obj.choices[0] && obj.choices[0].delta;
+              var piece = (delta && delta.content) || "";
+              if (piece) {
+                answer += piece;
+                chunks++;
+                bubble.textContent = answer;
+                scrollBottom();
+              }
+            } catch (e) { /* 忽略不完整 chunk */ }
+          }
+          return pump();
+        });
+      }
+      return pump();
+    }).catch(function (err) {
+      if (err && err.name === "AbortError") {
+        stopped = true;
+      } else {
+        bubble.classList.remove("streaming");
+        if (!answer) {
+          bubble.textContent = "请求失败：" + (err && err.message ? err.message : "网络错误");
+          bubble.parentElement.classList.add("error");
+        }
+      }
+    }).then(function () {
+      bubble.classList.remove("streaming");
+      var elapsed = (performance.now() - t0) / 1000;
+      if (answer) {
+        messages.push({ role: "assistant", content: answer });
+        var meta = document.createElement("div");
+        meta.className = "meta";
+        var speed = elapsed > 0 ? (chunks / elapsed).toFixed(1) : "0";
+        meta.textContent = chunks + " tokens · " + elapsed.toFixed(1) + " s · " +
+          speed + " tok/s" + (stopped ? " · 已手动停止" : "");
+        bubble.parentElement.appendChild(meta);
+      } else if (stopped) {
+        bubble.parentElement.remove();
+        messages.pop(); // 用户消息也撤回，保持历史一致
+      }
+      setGenerating(false);
+      scrollBottom();
+      input.focus();
+    });
+  }
+
+  input.focus();
+})();
+</script>
+</body>
+</html>

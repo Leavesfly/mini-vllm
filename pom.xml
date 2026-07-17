@@ -38,6 +38,11 @@
                 <version>3.11.0</version>
                 <configuration>
                     <release>17</release>
+                    <!-- DotKernel 的 SIMD 实现依赖 Vector API（incubator 模块） -->
+                    <compilerArgs>
+                        <arg>--add-modules</arg>
+                        <arg>jdk.incubator.vector</arg>
+                    </compilerArgs>
                 </configuration>
             </plugin>
             <plugin>
@@ -54,6 +59,10 @@
                         <manifest>
                             <mainClass>io.leavesfly.minivllm.MiniVllmServer</mainClass>
                         </manifest>
+                        <!-- java -jar 运行时解析 Vector API 模块；缺失时 DotKernel 自动回退标量 -->
+                        <manifestEntries>
+                            <Add-Modules>jdk.incubator.vector</Add-Modules>
+                        </manifestEntries>
                     </archive>
                 </configuration>
             </plugin>

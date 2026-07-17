@@ -5,6 +5,7 @@ import com.sun.net.httpserver.HttpHandler;
 import io.leavesfly.minivllm.core.LLMEngine;
 import io.leavesfly.minivllm.core.Sequence;
 import io.leavesfly.minivllm.json.SimpleJson;
+import io.leavesfly.minivllm.tokenizer.ChatTemplate;
 
 import java.io.IOException;
 import java.io.InputStream;
@@ -66,9 +67,10 @@ public final class OpenAiHandler implements HttpHandler {
         @SuppressWarnings("unchecked")
         Map<String, Object> req = SimpleJson.parseObject(body);
 
-        String prompt = extractPrompt(req);
+        boolean enableThinking = Boolean.TRUE.equals(req.get("enable_thinking"));
+        String prompt = extractPrompt(req, enableThinking);
         boolean stream = Boolean.TRUE.equals(req.get("stream"));
-        int maxTokens = intOr(req.get("max_tokens"), 128);
+        int maxTokens = intOr(req.get("max_tokens"), 512);
         float temperature = (float) doubleOr(req.get("temperature"), 0.8);
         float topP = (float) doubleOr(req.get("top_p"), 0.9);
         int topK = intOr(req.get("top_k"), 0);
@@ -191,22 +193,27 @@ public final class OpenAiHandler implements HttpHandler {
 
     // ---------- 工具方法 ----------
 
-    /** 从 messages 数组拼接 prompt（role: content 换行连接） */
+    /**
+     * 从 messages 数组构造 prompt：
+     * - chatML 模式（Qwen3 等对话模型）：渲染为 ChatML 格式（<|im_start|>...<|im_end|>）
+     * - 纯文本模式（prompt 字段 / 学习用微模型）：原样返回
+     */
     @SuppressWarnings("unchecked")
-    private String extractPrompt(Map<String, Object> req) {
+    private String extractPrompt(Map<String, Object> req, boolean enableThinking) {
         Object msgs = req.get("messages");
         if (msgs == null) {
+            // 纯文本 prompt（学习用微模型）：不套 ChatML，原样返回
             Object p = req.get("prompt");
             return p == null ? "" : p.toString();
         }
-        StringBuilder sb = new StringBuilder();
+        List<ChatTemplate.Message> list = new ArrayList<>();
         for (Object o : (List<Object>) msgs) {
             Map<String, Object> m = (Map<String, Object>) o;
             String role = String.valueOf(m.getOrDefault("role", "user"));
             String content = String.valueOf(m.getOrDefault("content", ""));
-            sb.append(role).append(": ").append(content).append('\n');
+            list.add(new ChatTemplate.Message(role, content));
         }
-        return sb.toString();
+        return ChatTemplate.applyChatML(list, enableThinking);
     }
 
     private String readBody(HttpExchange exchange) throws IOException {
