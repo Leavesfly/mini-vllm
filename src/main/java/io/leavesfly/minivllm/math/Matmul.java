@@ -27,8 +27,8 @@ public final class Matmul {
 
     /** 选定的点积内核（向量优先，标量兜底） */
     public static final DotKernel KERNEL;
-    /** 并行线程池（守护线程，按物理核数） */
-    private static final int CORES = Math.max(1, Runtime.getRuntime().availableProcessors());
+    /** 并行线程池大小：默认物理核数，可用 -Dmatmul.threads 覆盖（1 即纯串行，便于对比） */
+    private static final int CORES = resolveCores();
     private static final ExecutorService POOL = Executors.newFixedThreadPool(CORES, r -> {
         Thread t = new Thread(r, "mini-vllm-matmul");
         t.setDaemon(true);
@@ -38,14 +38,30 @@ public final class Matmul {
     private static final int PARALLEL_THRESHOLD = 1024;
 
     static {
+        // 内核选择优先级：-Dmatmul.kernel=scalar|vector 显式指定 > 运行时探测 Vector API
+        String forced = System.getProperty("matmul.kernel");
         DotKernel k;
-        try {
-            Class.forName("jdk.incubator.vector.FloatVector");
-            k = new VectorDotKernel();
-        } catch (Throwable t) {
+        if ("scalar".equalsIgnoreCase(forced)) {
             k = new ScalarDotKernel();
+        } else {
+            try {
+                Class.forName("jdk.incubator.vector.FloatVector");
+                k = new VectorDotKernel();
+            } catch (Throwable t) {
+                k = new ScalarDotKernel();
+            }
         }
         KERNEL = k;
+    }
+
+    /** 解析线程数：-Dmatmul.threads 优先，否则取可用处理器数，下限 1 */
+    private static int resolveCores() {
+        int def = Math.max(1, Runtime.getRuntime().availableProcessors());
+        Integer override = Integer.getInteger("matmul.threads");
+        if (override != null && override > 0) {
+            return override;
+        }
+        return def;
     }
 
     private Matmul() {
@@ -56,9 +72,31 @@ public final class Matmul {
         return KERNEL.name();
     }
 
+    /** 一行诊断信息（内核 / 线程 / 并行阈值），供启动时打印 */
+    public static String diagnostics() {
+        return "matmul kernel=" + KERNEL.name() + ", threads=" + CORES
+                + ", parallelThreshold=" + PARALLEL_THRESHOLD;
+    }
+
     /** CPU 核数 */
     public static int cores() {
         return CORES;
+    }
+
+    /**
+     * 公共点积入口：a[aOff..aOff+len) · b[bOff..bOff+len)。
+     * DotKernel 接口为包私有，跨包（model 等）需经此方法复用 SIMD／标量内核。
+     */
+    public static float dot(float[] a, int aOff, float[] b, int bOff, int len) {
+        return KERNEL.dot(a, aOff, b, bOff, len);
+    }
+
+    /**
+     * 公共 BF16 点积入口：a 为 bf16 位（short 权重），b 为 f32 激活。
+     * 与 {@link #dot} 算术等价，但权重只占一半内存/带宽（decode 内存受限时更快）。
+     */
+    public static float dotBf16(short[] a, int aOff, float[] b, int bOff, int len) {
+        return KERNEL.dotBf16(a, aOff, b, bOff, len);
     }
 
     /**
@@ -66,7 +104,16 @@ public final class Matmul {
      * total 小于阈值时串行，避免线程调度开销。
      */
     public static void parallelRows(int total, IntConsumer rowTask) {
-        if (total < PARALLEL_THRESHOLD || CORES == 1) {
+        parallelRows(total, PARALLEL_THRESHOLD, rowTask);
+    }
+
+    /**
+     * 带自定义阈值的行分块并行。
+     * total < threshold 或单核时串行。用于“列数少但每列开销大”的场景
+     *（如多头注意力：nHead 仅十几个，但长上下文时每头计算量大，值得并行）。
+     */
+    public static void parallelRows(int total, int threshold, IntConsumer rowTask) {
+        if (total < threshold || CORES == 1) {
             for (int i = 0; i < total; i++) {
                 rowTask.accept(i);
             }
@@ -155,6 +202,16 @@ public final class Matmul {
     public static float[] matVec(float[] w, float[] x, int m, int k) {
         float[] y = new float[m];
         parallelRows(m, i -> y[i] = KERNEL.dot(w, i * k, x, 0, k));
+        return y;
+    }
+
+    /**
+     * BF16 权重版矩阵与向量乘：y(m) = W(m,k) · x(k)，W 为 bf16 位（short）行优先 [m,k]。
+     * 与 {@link #matVec} 完全同构，仅权重存储为 bf16——decode/prefill 的投影与 lm_head 复用此路径。
+     */
+    public static float[] matVecBf16(short[] w, float[] x, int m, int k) {
+        float[] y = new float[m];
+        parallelRows(m, i -> y[i] = KERNEL.dotBf16(w, i * k, x, 0, k));
         return y;
     }
 }

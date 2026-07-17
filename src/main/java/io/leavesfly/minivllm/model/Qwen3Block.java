@@ -57,6 +57,24 @@ public final class Qwen3Block {
         return x;
     }
 
+    /**
+     * 批量 Decode：x[B, dModel] -> y[B, dModel]（B 个序列各一个新 token）。
+     * attention 按序列独立走 KV cache；FFN 与投影按 [B, dModel] 批量（权重跨 B 行复用）。
+     */
+    public float[] decodeBatch(float[] x, int batch, int[] curIdxs,
+                               KVCacheManager kvMgr, BlockTable[] bts) {
+        float[] h = x.clone();
+        ln1.forwardRowsInPlace(h, batch);
+        float[] a = attn.decodeBatch(h, batch, curIdxs, kvMgr, bts); // [B, dModel]
+        for (int i = 0; i < x.length; i++) x[i] += a[i];
+
+        float[] h2 = x.clone();
+        ln2.forwardRowsInPlace(h2, batch);
+        float[] f = ffn.forwardBatch(h2, batch);
+        for (int i = 0; i < x.length; i++) x[i] += f[i];
+        return x;
+    }
+
     /** 纯前向（无 KV cache）：x[seqLen, dModel] -> y[seqLen, dModel] */
     public float[] forward(float[] x, int seqLen) {
         float[] h = x.clone();

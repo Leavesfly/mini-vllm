@@ -36,6 +36,32 @@ public interface LlmModel {
      */
     float[] decodeLogits(int tokenId, int curIdx, KVCacheManager kvMgr, BlockTable[] bts);
 
+    /**
+     * 批量 Decode：一次处理 B 个并发序列各自的新 token，返回每个序列的 logits。
+     *
+     * 这是 vLLM 提升吞吐的核心——把 B 个序列的隐状态堆成 [B, dModel] 矩阵，
+     * 所有 Linear 投影按 GEMM 计算：权重只从内存读一次、跨 B 行复用，
+     * 既摊薄权重读取带宽，又摊薄单 token decode 的 fork-join 调度开销。
+     * 注意力仍按序列独立（各有 KV cache 与位置）。
+     *
+     * 默认实现逐序列回退到 {@link #decodeLogits}（行为等价），
+     * 支持批处理的模型（如 Qwen3）可覆盖为真正的批量前向。
+     *
+     * @param tokenIds 每个序列的当前 token id，长度 B
+     * @param curIdxs  每个序列当前 token 的全局下标，长度 B
+     * @param kvMgr    KV cache 管理器
+     * @param bts      每个序列各层的 BlockTable，形状 [B][nLayer]
+     * @return [B][vocabSize] 每个序列的 logits
+     */
+    default float[][] decodeLogitsBatch(int[] tokenIds, int[] curIdxs,
+                                        KVCacheManager kvMgr, BlockTable[][] bts) {
+        float[][] out = new float[tokenIds.length][];
+        for (int i = 0; i < tokenIds.length; i++) {
+            out[i] = decodeLogits(tokenIds[i], curIdxs[i], kvMgr, bts[i]);
+        }
+        return out;
+    }
+
     /** 模型配置 */
     ModelConfig config();
 

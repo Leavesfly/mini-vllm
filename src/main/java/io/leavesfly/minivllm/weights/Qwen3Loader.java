@@ -89,6 +89,54 @@ public final class Qwen3Loader {
         return model;
     }
 
+    /**
+     * 从 bf16 位权重字典构造 Qwen3Model（大矩阵以 bf16 常驻，内存/带宽减半）。
+     * 与 {@link #load} 等价，仅 embed_tokens 与各 Linear 权重以 short[] 存储；
+     * RmsNorm 的 gamma（小数组）仍转回 f32。点积时逐元素加宽，数值与 F32 路径一致。
+     */
+    public static Qwen3Model loadBf16(ModelConfig cfg, Map<String, short[]> weights) {
+        Set<String> consumed = new HashSet<>();
+        Embedding wte = Embedding.ofBf16(
+                getBits(weights, consumed, "model.embed_tokens.weight", cfg.vocabSize * cfg.dModel),
+                cfg.vocabSize, cfg.dModel);
+        RotaryEmbedding rope = new RotaryEmbedding(cfg.headDim(), cfg.maxSeqLen, cfg.ropeTheta);
+
+        Qwen3Block[] blocks = new Qwen3Block[cfg.nLayer];
+        for (int i = 0; i < cfg.nLayer; i++) {
+            String p = "model.layers." + i + ".";
+            RmsNorm ln1 = rmsBits(weights, consumed, p + "input_layernorm.weight", cfg.dModel, cfg.rmsNormEps);
+            RmsNorm ln2 = rmsBits(weights, consumed, p + "post_attention_layernorm.weight", cfg.dModel, cfg.rmsNormEps);
+            Linear q = linearBits(weights, consumed, p + "self_attn.q_proj.weight", cfg.dModel, cfg.qDim());
+            Linear k = linearBits(weights, consumed, p + "self_attn.k_proj.weight", cfg.dModel, cfg.kvDim());
+            Linear v = linearBits(weights, consumed, p + "self_attn.v_proj.weight", cfg.dModel, cfg.kvDim());
+            Linear o = linearBits(weights, consumed, p + "self_attn.o_proj.weight", cfg.qDim(), cfg.dModel);
+            RmsNorm qNorm = rmsBits(weights, consumed, p + "self_attn.q_norm.weight", cfg.headDim(), cfg.rmsNormEps);
+            RmsNorm kNorm = rmsBits(weights, consumed, p + "self_attn.k_norm.weight", cfg.headDim(), cfg.rmsNormEps);
+            Qwen3Attention attn = new Qwen3Attention(cfg, q, k, v, o, qNorm, kNorm, rope);
+            Linear gate = linearBits(weights, consumed, p + "mlp.gate_proj.weight", cfg.dModel, cfg.dFfn);
+            Linear up = linearBits(weights, consumed, p + "mlp.up_proj.weight", cfg.dModel, cfg.dFfn);
+            Linear down = linearBits(weights, consumed, p + "mlp.down_proj.weight", cfg.dFfn, cfg.dModel);
+            blocks[i] = new Qwen3Block(ln1, ln2, attn, new SwiGluFfn(gate, up, down), cfg.dModel);
+        }
+        RmsNorm lnF = rmsBits(weights, consumed, "model.norm.weight", cfg.dModel, cfg.rmsNormEps);
+
+        Set<String> extra = new HashSet<>(weights.keySet());
+        extra.removeAll(consumed);
+        if (cfg.tieWordEmbeddings) {
+            extra.remove("lm_head.weight");
+        }
+        if (!extra.isEmpty()) {
+            throw new IllegalArgumentException("存在未消费的权重张量: " + extra);
+        }
+        Qwen3Model model = new Qwen3Model(cfg, wte, blocks, lnF);
+        long expect = expectedParams(cfg);
+        if (model.numParameters() != expect) {
+            throw new IllegalArgumentException(
+                    "参数量不符: " + model.numParameters() + " 期望 " + expect);
+        }
+        return model;
+    }
+
     /** 随机初始化（无权重文件时跑通流程，输出无意义） */
     public static Qwen3Model randomInit(ModelConfig cfg) {
         Random rnd = new Random(42L);
@@ -139,6 +187,36 @@ public final class Qwen3Loader {
         }
         consumed.add(name);
         return d;
+    }
+
+    // ---------- bf16 位版辅助 ----------
+
+    private static short[] getBits(Map<String, short[]> w, Set<String> consumed, String name, int expect) {
+        short[] d = w.get(name);
+        if (d == null) {
+            throw new IllegalArgumentException("缺少权重: " + name);
+        }
+        if (d.length != expect) {
+            throw new IllegalArgumentException("权重 " + name + " 长度 " + d.length + " 期望 " + expect);
+        }
+        consumed.add(name);
+        return d;
+    }
+
+    private static Linear linearBits(Map<String, short[]> w, Set<String> consumed, String name,
+                                     int in, int out) {
+        return Linear.ofBf16(getBits(w, consumed, name, out * in), in, out);
+    }
+
+    /** RmsNorm gamma 为小数组，从 bf16 位转回 f32 */
+    private static RmsNorm rmsBits(Map<String, short[]> w, Set<String> consumed, String name,
+                                   int dim, float eps) {
+        short[] bits = getBits(w, consumed, name, dim);
+        float[] g = new float[dim];
+        for (int i = 0; i < dim; i++) {
+            g[i] = Bf16.bf16ToFloat(bits[i] & 0xFFFF);
+        }
+        return new RmsNorm(g, eps);
     }
 
     private static RmsNorm rms(Map<String, float[]> w, Set<String> consumed, String name,

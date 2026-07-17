@@ -137,14 +137,13 @@ public final class LLMEngine {
         }
     }
 
-    /** 对每个 running 请求各走一步 decode */
+    /** 对所有 running 请求做一步 decode（跨序列批处理成一次前向） */
     private void decodeStep() {
+        // 1. 收集处于 DECODE 且能扩容成功的序列（显存不足者置 ABORTED 并排除）
+        List<Sequence> batch = new ArrayList<>();
         for (Sequence seq : scheduler.running()) {
             if (seq.stage != Sequence.Stage.DECODE) continue;
-            int lastToken = seq.outputTokens.get(seq.outputTokens.size() - 1);
-            int curIdx = seq.totalLen() - 1; // 当前 token 的全局位置
-            int need = curIdx + 1;
-            // 按需扩容 KV cache（新 token 的 K/V 需要落位）
+            int need = seq.totalLen(); // 新 token 的 K/V 需要落位，容量至少 curIdx+1
             boolean ok = true;
             for (BlockTable bt : seq.blockTables) {
                 if (!kvMgr.ensureCapacity(bt, need)) {
@@ -156,9 +155,30 @@ public final class LLMEngine {
                 seq.stage = Sequence.Stage.ABORTED; // 显存不足，中止（学习版不做 preemption）
                 continue;
             }
-            float[] logits = model.decodeLogits(lastToken, curIdx, kvMgr, seq.blockTables);
+            batch.add(seq);
+        }
+        if (batch.isEmpty()) return;
+
+        // 2. 组装批量输入：把 B 个序列堆成一次前向（权重只读一次、跨 B 复用）
+        int b = batch.size();
+        int[] lastTokens = new int[b];
+        int[] curIdxs = new int[b];
+        BlockTable[][] bts = new BlockTable[b][];
+        for (int i = 0; i < b; i++) {
+            Sequence seq = batch.get(i);
+            lastTokens[i] = seq.outputTokens.get(seq.outputTokens.size() - 1);
+            curIdxs[i] = seq.totalLen() - 1;
+            bts[i] = seq.blockTables;
+        }
+
+        // 3. 批量前向 -> 每个序列的 logits
+        float[][] logits = model.decodeLogitsBatch(lastTokens, curIdxs, kvMgr, bts);
+
+        // 4. 逐序列采样并输出
+        for (int i = 0; i < b; i++) {
+            Sequence seq = batch.get(i);
             configureSampler(seq);
-            int nextToken = sampler.sample(logits);
+            int nextToken = sampler.sample(logits[i]);
             seq.outputTokens.add(nextToken);
             emitToken(seq, nextToken);
         }

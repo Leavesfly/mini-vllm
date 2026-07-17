@@ -1,5 +1,6 @@
 package io.leavesfly.minivllm.model;
 
+import io.leavesfly.minivllm.math.Matmul;
 import io.leavesfly.minivllm.math.RmsNorm;
 import io.leavesfly.minivllm.math.Softmax;
 import io.leavesfly.minivllm.memory.BlockTable;
@@ -125,45 +126,82 @@ public final class Qwen3Attention {
         applyQkNormAndRope(q, 0, k, 0, curIdx);
         kvMgr.writeKV(bt, curIdx, k, v);
 
+        float[] out = new float[qDim];
+        pagedAttention(q, 0, out, 0, curIdx, kvMgr, bt);
+        return oProj.forward(out);
+    }
+
+    /**
+     * 批量 Decode：一次处理 B 个序列各自的新 token。
+     *
+     * @param hidden  [B, dModel] B 个序列归一化后的隐状态
+     * @param batch   批大小 B
+     * @param curIdxs 每个序列当前 token 的全局下标
+     * @param bts     每个序列本层的 BlockTable
+     * @return [B, dModel] attention 输出
+     *
+     * q/k/v/o 投影走 forwardBatch（权重跨 B 行复用）；QK-Norm/RoPE/writeKV 与注意力按序列独立。
+     */
+    public float[] decodeBatch(float[] hidden, int batch, int[] curIdxs,
+                               KVCacheManager kvMgr, BlockTable[] bts) {
+        float[] q = qProj.forwardBatch(hidden, batch); // [B, qDim]
+        float[] k = kProj.forwardBatch(hidden, batch); // [B, kvDim]
+        float[] v = vProj.forwardBatch(hidden, batch); // [B, kvDim]
+        float[] kt = new float[kvDim];
+        float[] vt = new float[kvDim];
+        for (int b = 0; b < batch; b++) {
+            applyQkNormAndRope(q, b * qDim, k, b * kvDim, curIdxs[b]);
+            System.arraycopy(k, b * kvDim, kt, 0, kvDim);
+            System.arraycopy(v, b * kvDim, vt, 0, kvDim);
+            kvMgr.writeKV(bts[b], curIdxs[b], kt, vt);
+        }
+        float[] out = new float[batch * qDim];
+        for (int b = 0; b < batch; b++) {
+            pagedAttention(q, b * qDim, out, b * qDim, curIdxs[b], kvMgr, bts[b]);
+        }
+        return oProj.forwardBatch(out, batch); // [B, dModel]
+    }
+
+    /**
+     * PagedAttention block-wise 累加：用已 QK-Norm+RoPE 的 q（位于 qBase）与 bt 中历史 KV
+     * 计算 GQA 注意力，写入 out 的 outBase 处。单次/批量 decode 共用此核心。
+     */
+    private void pagedAttention(float[] q, int qBase, float[] out, int outBase,
+                               int curIdx, KVCacheManager kvMgr, BlockTable bt) {
         int totalTokens = curIdx + 1;
         int nBlocks = bt.numBlocks();
         float invSqrt = 1f / (float) Math.sqrt(headDim);
-        float[] out = new float[qDim];
 
         for (int h = 0; h < nHead; h++) {
-            int qOff = h * headDim;
+            int qOff = qBase + h * headDim;
             int kvOff = (h / group) * headDim; // GQA：Q 头 h 读 KV 头 h/group
             // 第一遍：逐 block 累加 attention scores
             float[] scores = new float[totalTokens];
-            for (int b = 0; b < nBlocks; b++) {
-                float[] kBlk = kvMgr.blockK(bt, b); // [blockSize, kvDim]
-                int remain = totalTokens - b * blockSize;
+            for (int blk = 0; blk < nBlocks; blk++) {
+                float[] kBlk = kvMgr.blockK(bt, blk); // [blockSize, kvDim]
+                int remain = totalTokens - blk * blockSize;
                 int tokensInBlock = Math.min(blockSize, Math.max(0, remain));
                 for (int s = 0; s < tokensInBlock; s++) {
                     int kOff = s * kvDim + kvOff;
-                    float sc = 0f;
-                    for (int d = 0; d < headDim; d++) {
-                        sc += q[qOff + d] * kBlk[kOff + d];
-                    }
-                    scores[b * blockSize + s] = sc * invSqrt;
+                    scores[blk * blockSize + s] = Matmul.dot(q, qOff, kBlk, kOff, headDim) * invSqrt;
                 }
             }
             Softmax.softmaxInPlace(scores);
             // 第二遍：逐 block 加权 V 累加输出
-            for (int b = 0; b < nBlocks; b++) {
-                float[] vBlk = kvMgr.blockV(bt, b);
-                int remain = totalTokens - b * blockSize;
+            int oOff = outBase + h * headDim;
+            for (int blk = 0; blk < nBlocks; blk++) {
+                float[] vBlk = kvMgr.blockV(bt, blk);
+                int remain = totalTokens - blk * blockSize;
                 int tokensInBlock = Math.min(blockSize, Math.max(0, remain));
                 for (int s = 0; s < tokensInBlock; s++) {
                     int vOff = s * kvDim + kvOff;
-                    float w = scores[b * blockSize + s];
+                    float w = scores[blk * blockSize + s];
                     for (int d = 0; d < headDim; d++) {
-                        out[qOff + d] += w * vBlk[vOff + d];
+                        out[oOff + d] += w * vBlk[vOff + d];
                     }
                 }
             }
         }
-        return oProj.forward(out);
     }
 
     // ===================== 内部工具 =====================
@@ -191,7 +229,8 @@ public final class Qwen3Attention {
     private float[] causalAttention(float[] q, float[] k, float[] v, int seqLen) {
         float[] out = new float[seqLen * qDim];
         float invSqrt = 1f / (float) Math.sqrt(headDim);
-        for (int h = 0; h < nHead; h++) {
+        // 多头并行：各头写入 out 的不同 qOff 区间，无数据竞争；prefill 计算量大，阈值降到 2 即并行
+        Matmul.parallelRows(nHead, 2, h -> {
             int qOff = h * headDim;
             int kvOff = (h / group) * headDim;
             for (int i = 0; i < seqLen; i++) {
@@ -199,11 +238,7 @@ public final class Qwen3Attention {
                 float[] scores = new float[i + 1];
                 for (int j = 0; j <= i; j++) {
                     int kj = j * kvDim + kvOff;
-                    float s = 0f;
-                    for (int d = 0; d < headDim; d++) {
-                        s += q[qi + d] * k[kj + d];
-                    }
-                    scores[j] = s * invSqrt;
+                    scores[j] = Matmul.dot(q, qi, k, kj, headDim) * invSqrt;
                 }
                 Softmax.softmaxInPlace(scores);
                 int oi = i * qDim + qOff;
@@ -215,7 +250,7 @@ public final class Qwen3Attention {
                     }
                 }
             }
-        }
+        });
         return out;
     }
 }

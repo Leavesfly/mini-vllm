@@ -75,6 +75,96 @@ public final class SafetensorsLoader {
         }
     }
 
+    /**
+     * 加载 safetensors，返回 tensor 名 -> bf16 位（short[]）。
+     * BF16 张量原样读取（零转换、更省内存/更快）；F32/F16 张量截断为 bf16 位。
+     * 供 bf16 常驻推理路径使用：权重以 bf16 存储，点积时逐元素加宽回 f32，算术与 F32 加载一致。
+     */
+    public static Map<String, short[]> loadBf16Bits(Path path) throws IOException {
+        try (FileChannel ch = FileChannel.open(path, StandardOpenOption.READ)) {
+            ByteBuffer lenBuf = ByteBuffer.allocate(8).order(ByteOrder.LITTLE_ENDIAN);
+            readFully(ch, lenBuf, 0);
+            lenBuf.flip();
+            long headerLen = lenBuf.getLong();
+            if (headerLen <= 0 || headerLen > ch.size()) {
+                throw new IOException("非法 safetensors header 长度: " + headerLen);
+            }
+            ByteBuffer headerBuf = ByteBuffer.allocate((int) headerLen);
+            readFully(ch, headerBuf, 8);
+            String headerJson = new String(headerBuf.array(), StandardCharsets.UTF_8);
+            Map<String, Object> header = SimpleJson.parseObject(headerJson);
+            long dataBase = 8 + headerLen;
+            Map<String, short[]> tensors = new LinkedHashMap<>();
+            for (Map.Entry<String, Object> e : header.entrySet()) {
+                String name = e.getKey();
+                if ("__metadata__".equals(name)) {
+                    continue;
+                }
+                @SuppressWarnings("unchecked")
+                Map<String, Object> info = (Map<String, Object>) e.getValue();
+                String dtype = (String) info.get("dtype");
+                @SuppressWarnings("unchecked")
+                List<Object> offsets = (List<Object>) info.get("data_offsets");
+                long start = ((Number) offsets.get(0)).longValue();
+                long end = ((Number) offsets.get(1)).longValue();
+                tensors.put(name, readTensorBf16(ch, dataBase + start, end - start, dtype, name));
+            }
+            return tensors;
+        }
+    }
+
+    /** 按 dtype 读取一个 tensor 并转为 bf16 位（short[]） */
+    private static short[] readTensorBf16(FileChannel ch, long absOffset, long byteLen,
+                                          String dtype, String name) throws IOException {
+        int elemBytes;
+        switch (dtype) {
+            case "F32": elemBytes = 4; break;
+            case "BF16": case "F16": elemBytes = 2; break;
+            default:
+                throw new IOException("暂不支持 dtype=" + dtype + ", tensor=" + name);
+        }
+        if (byteLen % elemBytes != 0) {
+            throw new IOException("tensor " + name + " 字节数 " + byteLen + " 与 dtype " + dtype + " 不对齐");
+        }
+        int n = (int) (byteLen / elemBytes);
+        short[] data = new short[n];
+        ByteBuffer chunk = ByteBuffer.allocate((int) Math.min(byteLen, 1 << 22));
+        int idx = 0;
+        long pos = absOffset;
+        long remain = byteLen;
+        while (remain > 0) {
+            int want = (int) Math.min(remain, chunk.capacity());
+            chunk.clear();
+            chunk.limit(want);
+            readFully(ch, chunk, pos);
+            chunk.flip();
+            int elems = want / elemBytes;
+            ByteBuffer le = chunk.order(ByteOrder.LITTLE_ENDIAN);
+            switch (dtype) {
+                case "BF16":
+                    for (int i = 0; i < elems; i++) {
+                        data[idx + i] = le.getShort();
+                    }
+                    break;
+                case "F16":
+                    for (int i = 0; i < elems; i++) {
+                        float f = Bf16.f16ToFloat(le.getShort() & 0xFFFF);
+                        data[idx + i] = (short) (Float.floatToIntBits(f) >>> 16); // f32 -> bf16 截断
+                    }
+                    break;
+                default: // F32
+                    for (int i = 0; i < elems; i++) {
+                        data[idx + i] = (short) (le.getInt() >>> 16); // f32 -> bf16 截断
+                    }
+                    break;
+            }
+            idx += elems;
+            pos += want;
+            remain -= want;
+        }
+        return data;
+    }
+
     /** 按 dtype 读取一个 tensor 并转为 F32 */
     private static float[] readTensor(FileChannel ch, long absOffset, long byteLen,
                                       String dtype, String name) throws IOException {

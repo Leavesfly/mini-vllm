@@ -1,5 +1,6 @@
 package io.leavesfly.minivllm.model;
 
+import io.leavesfly.minivllm.math.Matmul;
 import io.leavesfly.minivllm.memory.BlockTable;
 import io.leavesfly.minivllm.math.Softmax;
 import io.leavesfly.minivllm.memory.KVCacheManager;
@@ -117,11 +118,7 @@ public final class Attention {
                 float[] scores = new float[i - lo + 1];
                 for (int j = lo; j <= i; j++) {
                     int kOff = j * dModel + hOff;
-                    float s = 0f;
-                    for (int d = 0; d < headDim; d++) {
-                        s += q[qOff + d] * k[kOff + d];
-                    }
-                    scores[j - lo] = s * invSqrt;
+                    scores[j - lo] = Matmul.dot(q, qOff, k, kOff, headDim) * invSqrt;
                 }
                 Softmax.softmaxInPlace(scores);
                 int oOff = i * dModel + hOff;
@@ -190,11 +187,7 @@ public final class Attention {
                     int gid = b * blockSize + s; // 该 token 的全局下标
                     if (gid < lo) continue;      // 稀疏窗口外，跳过
                     int kOff = s * dModel + hOff;
-                    float sc = 0f;
-                    for (int d = 0; d < headDim; d++) {
-                        sc += q[hOff + d] * kBlk[kOff + d];
-                    }
-                    scores[gid - lo] = sc * invSqrt;
+                    scores[gid - lo] = Matmul.dot(q, hOff, kBlk, kOff, headDim) * invSqrt;
                 }
             }
             Softmax.softmaxInPlace(scores);
@@ -256,11 +249,7 @@ public final class Attention {
             float[] scores = new float[totalTokens - lo];
             for (int j = lo; j < totalTokens; j++) {
                 int kOff = j * dModel + hOff;
-                float s = 0f;
-                for (int d = 0; d < headDim; d++) {
-                    s += q[hOff + d] * kAll[kOff + d];
-                }
-                scores[j - lo] = s * invSqrt;
+                scores[j - lo] = Matmul.dot(q, hOff, kAll, kOff, headDim) * invSqrt;
             }
             Softmax.softmaxInPlace(scores);
             for (int j = lo; j < totalTokens; j++) {

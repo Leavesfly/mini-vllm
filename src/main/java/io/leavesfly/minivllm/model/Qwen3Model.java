@@ -74,6 +74,40 @@ public final class Qwen3Model implements LlmModel {
         return logits(decode(tokenId, curIdx, kvMgr, bts));
     }
 
+    @Override
+    public float[][] decodeLogitsBatch(int[] tokenIds, int[] curIdxs,
+                                       KVCacheManager kvMgr, BlockTable[][] bts) {
+        int batch = tokenIds.length;
+        if (batch == 1) {
+            // 单序列走原路径，避免批量开销
+            return new float[][]{decodeLogits(tokenIds[0], curIdxs[0], kvMgr, bts[0])};
+        }
+        // 1. 批量词嵌入：[B, dModel]
+        float[] x = new float[batch * dModel];
+        for (int b = 0; b < batch; b++) {
+            float[] row = wte.lookup(tokenIds[b]);
+            System.arraycopy(row, 0, x, b * dModel, dModel);
+        }
+        // 2. 逐层批量前向（每层收集各序列的本层 BlockTable）
+        BlockTable[] layerBts = new BlockTable[batch];
+        for (int i = 0; i < blocks.length; i++) {
+            for (int b = 0; b < batch; b++) {
+                layerBts[b] = bts[b][i];
+            }
+            x = blocks[i].decodeBatch(x, batch, curIdxs, kvMgr, layerBts);
+            trace(i, x);
+        }
+        lnF.forwardRowsInPlace(x, batch);
+        // 3. 逐序列 lm_head 投影
+        float[][] out = new float[batch][];
+        float[] row = new float[dModel];
+        for (int b = 0; b < batch; b++) {
+            System.arraycopy(x, b * dModel, row, 0, dModel);
+            out[b] = logits(row);
+        }
+        return out;
+    }
+
     // ===================== 内部前向 =====================
 
     private float[] prefill(int[] tokenIds, KVCacheManager kvMgr, BlockTable[] bts, int startIdx) {
@@ -139,6 +173,23 @@ public final class Qwen3Model implements LlmModel {
         int seqLen = inputIds.length;
         float[] last = new float[cfg.vocabSize];
         System.arraycopy(l.data, (seqLen - 1) * cfg.vocabSize, last, 0, cfg.vocabSize);
+        return last;
+    }
+
+    /**
+     * 便捷：整段前向后仅取最后一个位置、final norm 之后的 hidden（hs[-1]）。
+     * 与 {@link #forward} 同路径，但止于 model.norm 之前的 lm_head 投影，用于逐层对齐验证。
+     */
+    public float[] forwardLastHidden(int[] inputIds) {
+        int seqLen = inputIds.length;
+        float[] x = wte.lookupBatch(inputIds);
+        for (int i = 0; i < blocks.length; i++) {
+            x = blocks[i].forward(x, seqLen);
+            trace(i, x);
+        }
+        lnF.forwardRowsInPlace(x, seqLen);
+        float[] last = new float[dModel];
+        System.arraycopy(x, (seqLen - 1) * dModel, last, 0, dModel);
         return last;
     }
 

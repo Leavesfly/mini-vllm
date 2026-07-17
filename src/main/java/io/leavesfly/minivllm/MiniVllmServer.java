@@ -62,6 +62,7 @@ public final class MiniVllmServer {
         int maxSeqLen = 2048;  // Qwen3 模式的上下文上限（RoPE 表与 KV 池按此分配）
         boolean verbose = true;
         boolean gpt3 = false;
+        boolean bf16 = false;   // Qwen3 权重是否以 bf16 常驻（省一半内存/带宽）
         String modelRepo = "Qwen/Qwen3-0.6B";
         String mirror = System.getenv("MINIVLLM_MIRROR"); // auto | hf | modelscope
 
@@ -74,6 +75,7 @@ public final class MiniVllmServer {
                 case "--max-seq-len": maxSeqLen = Integer.parseInt(args[++i]); break;
                 case "--random": random = true; break;
                 case "--gpt3": gpt3 = true; break;
+                case "--bf16": bf16 = true; break;
                 case "--model-repo": modelRepo = args[++i]; break;
                 case "--mirror": mirror = args[++i]; break;
                 case "--max-seqs": maxNumSeqs = Integer.parseInt(args[++i]); break;
@@ -84,6 +86,14 @@ public final class MiniVllmServer {
         }
 
         // ---------- 2. 加载模型与分词器 ----------
+        // 运行时体检：确认 SIMD 内核是否生效、线程数、可用堆——decode 慢时先看这行
+        long maxHeapMb = Runtime.getRuntime().maxMemory() / (1024 * 1024);
+        System.out.println("[runtime] " + io.leavesfly.minivllm.math.Matmul.diagnostics()
+                + ", maxHeap=" + maxHeapMb + "MB");
+        if ("scalar".equals(io.leavesfly.minivllm.math.Matmul.kernelName())) {
+            System.out.println("[runtime] 警告: 使用标量内核，decode 会慢数倍。"
+                    + "请用 java --add-modules jdk.incubator.vector 运行以启用 SIMD。");
+        }
         // 未显式指定任何模式时，默认加载 Qwen3-0.6B：优先复用本地缓存，缺失则自动下载
         if (modelDir == null && !random && !gpt3 && weightsPath == null) {
             modelDir = new ModelDownloader(modelRepo, mirror).resolve().toString();
@@ -107,12 +117,20 @@ public final class MiniVllmServer {
                 model = Qwen3Loader.randomInit(cfg);
                 System.out.println("使用随机初始化 Qwen3 模型（输出无意义，仅验证流程）");
             } else {
-                System.out.println("加载权重: " + dir.resolve("model.safetensors"));
+                System.out.println("加载权重: " + dir.resolve("model.safetensors")
+                        + (bf16 ? " (bf16 常驻)" : " (f32 常驻)"));
                 long t0 = System.currentTimeMillis();
-                Map<String, float[]> weights = SafetensorsLoader.load(dir.resolve("model.safetensors"));
-                System.out.printf("权重读取完成: %d 个张量, %.1f s%n",
-                        weights.size(), (System.currentTimeMillis() - t0) / 1000.0);
-                model = Qwen3Loader.load(cfg, weights);
+                if (bf16) {
+                    Map<String, short[]> weights = SafetensorsLoader.loadBf16Bits(dir.resolve("model.safetensors"));
+                    System.out.printf("权重读取完成: %d 个张量, %.1f s%n",
+                            weights.size(), (System.currentTimeMillis() - t0) / 1000.0);
+                    model = Qwen3Loader.loadBf16(cfg, weights);
+                } else {
+                    Map<String, float[]> weights = SafetensorsLoader.load(dir.resolve("model.safetensors"));
+                    System.out.printf("权重读取完成: %d 个张量, %.1f s%n",
+                            weights.size(), (System.currentTimeMillis() - t0) / 1000.0);
+                    model = Qwen3Loader.load(cfg, weights);
+                }
             }
             tokenizer = BpeTokenizer.fromModelDir(dir);
             eosTokens = cfg.eosTokenIds.length > 0 ? cfg.eosTokenIds : new int[]{151645, 151643};

@@ -45,10 +45,17 @@ public final class Benchmark {
         ModelConfig cfg = ModelConfig.fromConfigJson(SimpleJson.parseObject(
                 Files.readString(modelDir.resolve("config.json"))));
         cfg.maxSeqLen = 2048;
-        System.out.println("加载权重...");
+        boolean bf16 = Boolean.getBoolean("weights.bf16");
+        System.out.println("加载权重... (" + (bf16 ? "bf16 常驻" : "f32 常驻") + ")");
         long t0 = System.currentTimeMillis();
-        Map<String, float[]> weights = SafetensorsLoader.load(modelDir.resolve("model.safetensors"));
-        Qwen3Model model = Qwen3Loader.load(cfg, weights);
+        Qwen3Model model;
+        if (bf16) {
+            Map<String, short[]> weights = SafetensorsLoader.loadBf16Bits(modelDir.resolve("model.safetensors"));
+            model = Qwen3Loader.loadBf16(cfg, weights);
+        } else {
+            Map<String, float[]> weights = SafetensorsLoader.load(modelDir.resolve("model.safetensors"));
+            model = Qwen3Loader.load(cfg, weights);
+        }
         System.out.printf("模型加载完成: %d 参数, %.1f s%n",
                 model.numParameters(), (System.currentTimeMillis() - t0) / 1000.0);
 
@@ -86,6 +93,42 @@ public final class Benchmark {
         double decodeSec = (System.nanoTime() - start) / 1e9;
         System.out.printf("decode:  %d tokens in %.3f s -> %.1f tok/s%n",
                 totalDecode, decodeSec, totalDecode / decodeSec);
+
+        // 批量 decode 聚合吞吐（跨序列批处理：权重跨 B 行复用 + 摊薄 fork-join）
+        for (int b : new int[]{1, 2, 4}) {
+            double tps = runDecodeBatchThroughput(model, cfg, prompt, b, DECODE_TOKENS);
+            System.out.printf("decode batch B=%d: 聚合 %.1f tok/s（人均 %.1f tok/s）%n", b, tps, tps / b);
+        }
+    }
+
+    /** 批量 decode 聚合吞吐（仅计 decode 阶段，不含 prefill），返回总 tok/s */
+    private static double runDecodeBatchThroughput(Qwen3Model model, ModelConfig cfg, int[] prompt, int batch, int n) {
+        KVCacheManager kvMgr = new KVCacheManager(4096, cfg.blockSize, cfg.kvDim());
+        BlockTable[][] bts = new BlockTable[batch][cfg.nLayer];
+        float[][] logits = new float[batch][];
+        for (int b = 0; b < batch; b++) {
+            for (int i = 0; i < cfg.nLayer; i++) {
+                bts[b][i] = new BlockTable();
+            }
+            for (BlockTable bt : bts[b]) {
+                kvMgr.ensureCapacity(bt, prompt.length + n);
+            }
+            logits[b] = model.prefillLogits(prompt, kvMgr, bts[b], 0);
+        }
+        int[] lastTokens = new int[batch];
+        int[] curIdxs = new int[batch];
+        long begin = System.nanoTime();
+        for (int t = 0; t < n; t++) {
+            for (int b = 0; b < batch; b++) {
+                lastTokens[b] = argmax(logits[b]);
+                curIdxs[b] = prompt.length + t;
+            }
+            if (t < n - 1) {
+                logits = model.decodeLogitsBatch(lastTokens, curIdxs, kvMgr, bts);
+            }
+        }
+        double sec = (System.nanoTime() - begin) / 1e9;
+        return (double) batch * n / sec;
     }
 
     /** 返回实际生成的 token 数 */
