@@ -21,12 +21,21 @@ public final class Qwen3Block {
     private final SwiGluFfn ffn;
     private final int dModel;
 
+    /**
+     * 预分配工作缓冲（decode 单 token 路径复用，避免每 token 56 次 clone 的 GC 压力）。
+     * 引擎 step 为单线程顺序调用，无并发安全问题。
+     */
+    private final float[] hBuf;
+    private final float[] h2Buf;
+
     public Qwen3Block(RmsNorm ln1, RmsNorm ln2, Qwen3Attention attn, SwiGluFfn ffn, int dModel) {
         this.ln1 = ln1;
         this.ln2 = ln2;
         this.attn = attn;
         this.ffn = ffn;
         this.dModel = dModel;
+        this.hBuf = new float[dModel];
+        this.h2Buf = new float[dModel];
     }
 
     /** Prefill：x[seqLen, dModel] -> y[seqLen, dModel] */
@@ -43,16 +52,16 @@ public final class Qwen3Block {
         return x;
     }
 
-    /** Decode：x[dModel] -> y[dModel]（单 token） */
+    /** Decode：x[dModel] -> y[dModel]（单 token，复用预分配缓冲避免 GC） */
     public float[] decode(float[] x, int curIdx, KVCacheManager kvMgr, BlockTable bt) {
-        float[] h = x.clone();
-        ln1.forwardInPlace(h);
-        float[] a = attn.decodePaged(h, curIdx, kvMgr, bt);
+        System.arraycopy(x, 0, hBuf, 0, dModel);
+        ln1.forwardInPlace(hBuf);
+        float[] a = attn.decodePaged(hBuf, curIdx, kvMgr, bt);
         for (int i = 0; i < dModel; i++) x[i] += a[i];
 
-        float[] h2 = x.clone();
-        ln2.forwardInPlace(h2);
-        float[] f = ffn.forward(h2);
+        System.arraycopy(x, 0, h2Buf, 0, dModel);
+        ln2.forwardInPlace(h2Buf);
+        float[] f = ffn.forward(h2Buf);
         for (int i = 0; i < dModel; i++) x[i] += f[i];
         return x;
     }

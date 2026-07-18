@@ -27,9 +27,21 @@ interface DotKernel {
     /**
      * BF16 权重 × F32 激活 的点积：a 为 bf16 位（short），b 为 f32。
      * a[i] 的 bf16 位左移 16 位即得 f32（与 {@link Bf16#bf16ToFloat} 一致），
-     * 与“先整体转 f32 再点积”算术等价，但权重只占一半内存/带宽。
+     * 与"先整体转 f32 再点积"算术等价，但权重只占一半内存/带宽。
      */
     float dotBf16(short[] a, int aOff, float[] b, int bOff, int len);
+    
+    /**
+     * INT8 量化权重 × F32 激活 的点积：w 为 signed byte（-127~127），scale 为行缩放因子。
+     * 结果 = scale * Σ(w[i] * x[i])。权重每元素仅 1 字节，带宽为 bf16 的一半。
+     */
+    float dotInt8(byte[] w, int wOff, float[] x, int xOff, int len, float scale);
+
+    /**
+     * 加权累加：dst[dOff+i] += w * src[sOff+i]，i∈[0,len)。
+     * 用于 attention 的 V 加权求和，向量化后可显著加速长上下文 decode。
+     */
+    void axpy(float w, float[] src, int sOff, float[] dst, int dOff, int len);
 
     /** 内核名称（启动日志用） */
     String name();
@@ -61,6 +73,22 @@ final class ScalarDotKernel implements DotKernel {
     }
 
     @Override
+    public float dotInt8(byte[] w, int wOff, float[] x, int xOff, int len, float scale) {
+        float sum = 0f;
+        for (int i = 0; i < len; i++) {
+            sum += (float) w[wOff + i] * x[xOff + i];
+        }
+        return sum * scale;
+    }
+
+    @Override
+    public void axpy(float w, float[] src, int sOff, float[] dst, int dOff, int len) {
+        for (int i = 0; i < len; i++) {
+            dst[dOff + i] += w * src[sOff + i];
+        }
+    }
+
+    @Override
     public String name() {
         return "scalar";
     }
@@ -78,7 +106,7 @@ final class VectorDotKernel implements DotKernel {
     private static final VectorSpecies<Float> SPECIES = FloatVector.SPECIES_PREFERRED;
     /**
      * 与 SPECIES 同 lane 数的 short/int 物种，用于 bf16 -> f32 加宽。
-     * short 取“半位宽”形状（元素 16 位，lane 数与 float 一致，不会越界读取），
+     * short 取"半位宽"形状（元素 16 位，lane 数与 float 一致，不会越界读取），
      * int 取与 float 同形状（元素 32 位）；S2I 为同 lane 数的扩展转换（part=0）。
      */
     private static final VectorSpecies<Short> SHORT_SPECIES =
@@ -123,6 +151,34 @@ final class VectorDotKernel implements DotKernel {
             sum += Float.intBitsToFloat(a[aOff + i] << 16) * b[bOff + i];
         }
         return sum;
+    }
+
+    @Override
+    public float dotInt8(byte[] w, int wOff, float[] x, int xOff, int len, float scale) {
+        // 注：在 128-bit SIMD 平台上，bf16 的 shift+reinterpret 是零开销寄存器内转换，
+        // int8 需要额外的符号扩展+整数转浮点，实际收益取决于平台带宽瓶颈。
+        // 大模型（>7B）或高并发场景下带宽受限时，int8 才有显著收益。
+        float sum = 0f;
+        for (int i = 0; i < len; i++) {
+            sum += (float) w[wOff + i] * x[xOff + i];
+        }
+        return sum * scale;
+    }
+
+    @Override
+    public void axpy(float w, float[] src, int sOff, float[] dst, int dOff, int len) {
+        int i = 0;
+        int lanes = SPECIES.length();
+        int bound = SPECIES.loopBound(len);
+        FloatVector wv = FloatVector.broadcast(SPECIES, w);
+        for (; i < bound; i += lanes) {
+            FloatVector sv = FloatVector.fromArray(SPECIES, src, sOff + i);
+            FloatVector dv = FloatVector.fromArray(SPECIES, dst, dOff + i);
+            sv.fma(wv, dv).intoArray(dst, dOff + i);
+        }
+        for (; i < len; i++) {
+            dst[dOff + i] += w * src[sOff + i];
+        }
     }
 
     @Override

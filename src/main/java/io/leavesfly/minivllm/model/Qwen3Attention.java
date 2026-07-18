@@ -40,6 +40,14 @@ public final class Qwen3Attention {
     private final int kvDim;   // nKVHead * headDim
     private final int blockSize;
 
+    /**
+     * 融合 QKV 投影权重（性能优化）：把 q/k/v 三个 Linear 的权重拼接为一个
+     * [qDim+2*kvDim, dModel] 的大矩阵。decode 时一次 matVec 完成全部投影，
+     * 将 3 次 fork-join 线程调度合并为 1 次，减少每层 ~2 次调度开销。
+     */
+    private final Linear fusedQKV;
+    private final int qkvDim; // qDim + 2*kvDim
+
     public Qwen3Attention(ModelConfig cfg, Linear qProj, Linear kProj, Linear vProj, Linear oProj,
                           RmsNorm qNorm, RmsNorm kNorm, RotaryEmbedding rope) {
         this.qProj = qProj;
@@ -56,6 +64,36 @@ public final class Qwen3Attention {
         this.qDim = cfg.qDim();
         this.kvDim = cfg.kvDim();
         this.blockSize = cfg.blockSize;
+        this.qkvDim = qDim + 2 * kvDim;
+        this.fusedQKV = buildFusedQKV();
+    }
+
+    /** 拼接 q/k/v 权重为单个 Linear（支持 bf16/int8/f32 三种格式） */
+    private Linear buildFusedQKV() {
+        int in = qProj.inFeatures;
+        if (qProj.isBf16()) {
+            short[] w = new short[qkvDim * in];
+            System.arraycopy(qProj.weightBf16, 0, w, 0, qDim * in);
+            System.arraycopy(kProj.weightBf16, 0, w, qDim * in, kvDim * in);
+            System.arraycopy(vProj.weightBf16, 0, w, (qDim + kvDim) * in, kvDim * in);
+            return Linear.ofBf16(w, in, qkvDim);
+        } else if (qProj.isInt8()) {
+            byte[] w = new byte[qkvDim * in];
+            float[] s = new float[qkvDim];
+            System.arraycopy(qProj.weightInt8, 0, w, 0, qDim * in);
+            System.arraycopy(qProj.scaleInt8, 0, s, 0, qDim);
+            System.arraycopy(kProj.weightInt8, 0, w, qDim * in, kvDim * in);
+            System.arraycopy(kProj.scaleInt8, 0, s, qDim, kvDim);
+            System.arraycopy(vProj.weightInt8, 0, w, (qDim + kvDim) * in, kvDim * in);
+            System.arraycopy(vProj.scaleInt8, 0, s, qDim + kvDim, kvDim);
+            return Linear.ofInt8(w, s, in, qkvDim);
+        } else {
+            float[] w = new float[qkvDim * in];
+            System.arraycopy(qProj.weight, 0, w, 0, qDim * in);
+            System.arraycopy(kProj.weight, 0, w, qDim * in, kvDim * in);
+            System.arraycopy(vProj.weight, 0, w, (qDim + kvDim) * in, kvDim * in);
+            return Linear.of(w, in, qkvDim);
+        }
     }
 
     /** 参数量（q/k/v/o 投影 + qk norm） */
@@ -114,15 +152,22 @@ public final class Qwen3Attention {
 
     /**
      * Decode（PagedAttention block-wise 累加）：处理单个新 token。
+     * 性能优化：Q/K/V 融合投影，3 次 fork-join 合并为 1 次。
      *
      * @param hidden [dModel] 当前 token 归一化后的隐状态
      * @param curIdx 当前 token 的全局下标
      * @return [dModel] attention 输出
      */
     public float[] decodePaged(float[] hidden, int curIdx, KVCacheManager kvMgr, BlockTable bt) {
-        float[] q = qProj.forward(hidden); // [qDim]
-        float[] k = kProj.forward(hidden); // [kvDim]
-        float[] v = vProj.forward(hidden); // [kvDim]
+        // 融合 QKV 投影：一次 matVec 得到 [qDim+2*kvDim]，切分出 q/k/v
+        float[] qkv = fusedQKV.forward(hidden);
+        float[] q = new float[qDim];
+        float[] k = new float[kvDim];
+        float[] v = new float[kvDim];
+        System.arraycopy(qkv, 0, q, 0, qDim);
+        System.arraycopy(qkv, qDim, k, 0, kvDim);
+        System.arraycopy(qkv, qDim + kvDim, v, 0, kvDim);
+
         applyQkNormAndRope(q, 0, k, 0, curIdx);
         kvMgr.writeKV(bt, curIdx, k, v);
 
@@ -144,9 +189,17 @@ public final class Qwen3Attention {
      */
     public float[] decodeBatch(float[] hidden, int batch, int[] curIdxs,
                                KVCacheManager kvMgr, BlockTable[] bts) {
-        float[] q = qProj.forwardBatch(hidden, batch); // [B, qDim]
-        float[] k = kProj.forwardBatch(hidden, batch); // [B, kvDim]
-        float[] v = vProj.forwardBatch(hidden, batch); // [B, kvDim]
+        // 融合 QKV 投影：一次 forwardBatch 得到 [B, qkvDim]，切分出 q/k/v
+        float[] qkvAll = fusedQKV.forwardBatch(hidden, batch); // [B, qkvDim]
+        float[] q = new float[batch * qDim];
+        float[] k = new float[batch * kvDim];
+        float[] v = new float[batch * kvDim];
+        for (int b = 0; b < batch; b++) {
+            int src = b * qkvDim;
+            System.arraycopy(qkvAll, src, q, b * qDim, qDim);
+            System.arraycopy(qkvAll, src + qDim, k, b * kvDim, kvDim);
+            System.arraycopy(qkvAll, src + qDim + kvDim, v, b * kvDim, kvDim);
+        }
         float[] kt = new float[kvDim];
         float[] vt = new float[kvDim];
         for (int b = 0; b < batch; b++) {
@@ -165,6 +218,9 @@ public final class Qwen3Attention {
     /**
      * PagedAttention block-wise 累加：用已 QK-Norm+RoPE 的 q（位于 qBase）与 bt 中历史 KV
      * 计算 GQA 注意力，写入 out 的 outBase 处。单次/批量 decode 共用此核心。
+     *
+     * 性能：多头并行（各头写 out 的不同区间，无数据竞争），
+     * 长上下文时 attention 计算量大，阈值降为 2 即并行。
      */
     private void pagedAttention(float[] q, int qBase, float[] out, int outBase,
                                int curIdx, KVCacheManager kvMgr, BlockTable bt) {
@@ -172,7 +228,8 @@ public final class Qwen3Attention {
         int nBlocks = bt.numBlocks();
         float invSqrt = 1f / (float) Math.sqrt(headDim);
 
-        for (int h = 0; h < nHead; h++) {
+        // 多头并行：各头写入 out 的不同 qOff 区间，无数据竞争
+        Matmul.parallelRows(nHead, 2, h -> {
             int qOff = qBase + h * headDim;
             int kvOff = (h / group) * headDim; // GQA：Q 头 h 读 KV 头 h/group
             // 第一遍：逐 block 累加 attention scores
@@ -187,7 +244,7 @@ public final class Qwen3Attention {
                 }
             }
             Softmax.softmaxInPlace(scores);
-            // 第二遍：逐 block 加权 V 累加输出
+            // 第二遍：逐 block 加权 V 累加输出（SIMD axpy）
             int oOff = outBase + h * headDim;
             for (int blk = 0; blk < nBlocks; blk++) {
                 float[] vBlk = kvMgr.blockV(bt, blk);
@@ -196,12 +253,10 @@ public final class Qwen3Attention {
                 for (int s = 0; s < tokensInBlock; s++) {
                     int vOff = s * kvDim + kvOff;
                     float w = scores[blk * blockSize + s];
-                    for (int d = 0; d < headDim; d++) {
-                        out[oOff + d] += w * vBlk[vOff + d];
-                    }
+                    Matmul.axpy(w, vBlk, vOff, out, oOff, headDim);
                 }
             }
-        }
+        });
     }
 
     // ===================== 内部工具 =====================
@@ -245,9 +300,7 @@ public final class Qwen3Attention {
                 for (int j = 0; j <= i; j++) {
                     int vj = j * kvDim + kvOff;
                     float w = scores[j];
-                    for (int d = 0; d < headDim; d++) {
-                        out[oi + d] += w * v[vj + d];
-                    }
+                    Matmul.axpy(w, v, vj, out, oi, headDim);
                 }
             }
         });

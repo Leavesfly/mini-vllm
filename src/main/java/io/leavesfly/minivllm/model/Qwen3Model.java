@@ -98,14 +98,8 @@ public final class Qwen3Model implements LlmModel {
             trace(i, x);
         }
         lnF.forwardRowsInPlace(x, batch);
-        // 3. 逐序列 lm_head 投影
-        float[][] out = new float[batch][];
-        float[] row = new float[dModel];
-        for (int b = 0; b < batch; b++) {
-            System.arraycopy(x, b * dModel, row, 0, dModel);
-            out[b] = logits(row);
-        }
-        return out;
+        // 3. 融合 lm_head：一次 parallelRows 完成 B 个序列的词表投影，权重跨 B 复用
+        return wte.projectToVocabFused(x, batch);
     }
 
     // ===================== 内部前向 =====================

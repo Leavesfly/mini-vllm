@@ -100,6 +100,22 @@ public final class Matmul {
     }
 
     /**
+     * 公共 INT8 点积入口：w 为 signed byte 量化权重，x 为 f32 激活，scale 为行缩放因子。
+     * 结果 = scale * Σ(w[i] * x[i])。权重仅 1 字节/元素，带宽为 bf16 的一半。
+     */
+    public static float dotInt8(byte[] w, int wOff, float[] x, int xOff, int len, float scale) {
+        return KERNEL.dotInt8(w, wOff, x, xOff, len, scale);
+    }
+
+    /**
+     * 加权累加：dst[dOff+i] += w * src[sOff+i]。
+     * 用于 attention 的 V 加权求和，SIMD 向量化实现。
+     */
+    public static void axpy(float w, float[] src, int sOff, float[] dst, int dOff, int len) {
+        KERNEL.axpy(w, src, sOff, dst, dOff, len);
+    }
+
+    /**
      * 按 [0, total) 的行区间分块并行执行 rowTask。
      * total 小于阈值时串行，避免线程调度开销。
      */
@@ -109,8 +125,10 @@ public final class Matmul {
 
     /**
      * 带自定义阈值的行分块并行。
-     * total < threshold 或单核时串行。用于“列数少但每列开销大”的场景
+     * total < threshold 或单核时串行。用于"列数少但每列开销大"的场景
      *（如多头注意力：nHead 仅十几个，但长上下文时每头计算量大，值得并行）。
+     *
+     * 性能优化：当前线程参与第 0 块计算（而非空等），充分利用调用方 CPU 时间。
      */
     public static void parallelRows(int total, int threshold, IntConsumer rowTask) {
         if (total < threshold || CORES == 1) {
@@ -121,19 +139,24 @@ public final class Matmul {
         }
         int t = Math.min(CORES, total);
         int per = (total + t - 1) / t;
-        List<Future<?>> futures = new ArrayList<>(t);
-        for (int i = 0; i < t; i++) {
+        // 分发 chunks 1..t-1 到线程池，当前线程处理 chunk 0
+        List<Future<?>> futures = new ArrayList<>(t - 1);
+        for (int i = 1; i < t; i++) {
             int from = i * per;
             int to = Math.min(from + per, total);
-            if (from >= to) {
-                break;
-            }
+            if (from >= to) break;
             futures.add(POOL.submit(() -> {
                 for (int r = from; r < to; r++) {
                     rowTask.accept(r);
                 }
             }));
         }
+        // 当前线程处理第 0 块（不浪费等待时间）
+        int end0 = Math.min(per, total);
+        for (int r = 0; r < end0; r++) {
+            rowTask.accept(r);
+        }
+        // 等待其余线程完成
         for (Future<?> f : futures) {
             try {
                 f.get();
@@ -212,6 +235,17 @@ public final class Matmul {
     public static float[] matVecBf16(short[] w, float[] x, int m, int k) {
         float[] y = new float[m];
         parallelRows(m, i -> y[i] = KERNEL.dotBf16(w, i * k, x, 0, k));
+        return y;
+    }
+
+    /**
+     * INT8 量化权重版矩阵与向量乘：y(m) = W(m,k) · x(k)。
+     * W 为 signed byte 行优先 [m,k]，scale[m] 为每行缩放因子。
+     * y[i] = scale[i] * Σ(w[i*k+j] * x[j])。带宽为 bf16 的一半，decode 理论提速 60-80%。
+     */
+    public static float[] matVecInt8(byte[] w, float[] scale, float[] x, int m, int k) {
+        float[] y = new float[m];
+        parallelRows(m, i -> y[i] = KERNEL.dotInt8(w, i * k, x, 0, k, scale[i]));
         return y;
     }
 }

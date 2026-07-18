@@ -15,6 +15,8 @@ import java.util.Map;
 import java.util.Random;
 import java.util.Set;
 
+import io.leavesfly.minivllm.weights.Quantize.Int8Weight;
+
 /**
  * Qwen3Loader —— 把 HuggingFace Qwen3 权重字典组装成 Qwen3Model。
  *
@@ -137,6 +139,50 @@ public final class Qwen3Loader {
         return model;
     }
 
+    /**
+     * 从 bf16 位权重字典构造 INT8 量化版 Qwen3Model。
+     * 加载时先读 bf16，再逐张量 per-row 对称量化为 int8 + scale，
+     * 最终模型权重仅占 bf16 的一半内存，decode 带宽减半。
+     * RmsNorm gamma（小数组）仍转回 f32，不量化。
+     */
+    public static Qwen3Model loadInt8(ModelConfig cfg, Map<String, short[]> weights) {
+        Set<String> consumed = new HashSet<>();
+        // embed_tokens 量化
+        short[] embBits = getBits(weights, consumed, "model.embed_tokens.weight", cfg.vocabSize * cfg.dModel);
+        Int8Weight embQ = Quantize.quantizeBf16(embBits, cfg.vocabSize, cfg.dModel);
+        Embedding wte = Embedding.ofInt8(embQ.data, embQ.scale, cfg.vocabSize, cfg.dModel);
+        RotaryEmbedding rope = new RotaryEmbedding(cfg.headDim(), cfg.maxSeqLen, cfg.ropeTheta);
+
+        Qwen3Block[] blocks = new Qwen3Block[cfg.nLayer];
+        for (int i = 0; i < cfg.nLayer; i++) {
+            String p = "model.layers." + i + ".";
+            RmsNorm ln1 = rmsBits(weights, consumed, p + "input_layernorm.weight", cfg.dModel, cfg.rmsNormEps);
+            RmsNorm ln2 = rmsBits(weights, consumed, p + "post_attention_layernorm.weight", cfg.dModel, cfg.rmsNormEps);
+            Linear q = linearInt8(weights, consumed, p + "self_attn.q_proj.weight", cfg.dModel, cfg.qDim());
+            Linear k = linearInt8(weights, consumed, p + "self_attn.k_proj.weight", cfg.dModel, cfg.kvDim());
+            Linear v = linearInt8(weights, consumed, p + "self_attn.v_proj.weight", cfg.dModel, cfg.kvDim());
+            Linear o = linearInt8(weights, consumed, p + "self_attn.o_proj.weight", cfg.qDim(), cfg.dModel);
+            RmsNorm qNorm = rmsBits(weights, consumed, p + "self_attn.q_norm.weight", cfg.headDim(), cfg.rmsNormEps);
+            RmsNorm kNorm = rmsBits(weights, consumed, p + "self_attn.k_norm.weight", cfg.headDim(), cfg.rmsNormEps);
+            Qwen3Attention attn = new Qwen3Attention(cfg, q, k, v, o, qNorm, kNorm, rope);
+            Linear gate = linearInt8(weights, consumed, p + "mlp.gate_proj.weight", cfg.dModel, cfg.dFfn);
+            Linear up = linearInt8(weights, consumed, p + "mlp.up_proj.weight", cfg.dModel, cfg.dFfn);
+            Linear down = linearInt8(weights, consumed, p + "mlp.down_proj.weight", cfg.dFfn, cfg.dModel);
+            blocks[i] = new Qwen3Block(ln1, ln2, attn, new SwiGluFfn(gate, up, down), cfg.dModel);
+        }
+        RmsNorm lnF = rmsBits(weights, consumed, "model.norm.weight", cfg.dModel, cfg.rmsNormEps);
+
+        Set<String> extra = new HashSet<>(weights.keySet());
+        extra.removeAll(consumed);
+        if (cfg.tieWordEmbeddings) {
+            extra.remove("lm_head.weight");
+        }
+        if (!extra.isEmpty()) {
+            throw new IllegalArgumentException("存在未消费的权重张量: " + extra);
+        }
+        return new Qwen3Model(cfg, wte, blocks, lnF);
+    }
+
     /** 随机初始化（无权重文件时跑通流程，输出无意义） */
     public static Qwen3Model randomInit(ModelConfig cfg) {
         Random rnd = new Random(42L);
@@ -206,6 +252,14 @@ public final class Qwen3Loader {
     private static Linear linearBits(Map<String, short[]> w, Set<String> consumed, String name,
                                      int in, int out) {
         return Linear.ofBf16(getBits(w, consumed, name, out * in), in, out);
+    }
+
+    /** 从 bf16 位权重加载并就地量化为 INT8 Linear */
+    private static Linear linearInt8(Map<String, short[]> w, Set<String> consumed, String name,
+                                     int in, int out) {
+        short[] bits = getBits(w, consumed, name, out * in);
+        Int8Weight q = Quantize.quantizeBf16(bits, out, in);
+        return Linear.ofInt8(q.data, q.scale, in, out);
     }
 
     /** RmsNorm gamma 为小数组，从 bf16 位转回 f32 */

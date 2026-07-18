@@ -45,11 +45,15 @@ public final class Benchmark {
         ModelConfig cfg = ModelConfig.fromConfigJson(SimpleJson.parseObject(
                 Files.readString(modelDir.resolve("config.json"))));
         cfg.maxSeqLen = 2048;
-        boolean bf16 = Boolean.getBoolean("weights.bf16");
-        System.out.println("加载权重... (" + (bf16 ? "bf16 常驻" : "f32 常驻") + ")");
+        boolean int8 = Boolean.getBoolean("weights.int8");
+        boolean bf16 = Boolean.getBoolean("weights.bf16") || int8; // int8 从 bf16 量化而来
+        System.out.println("加载权重... (" + (int8 ? "int8 量化" : bf16 ? "bf16 常驻" : "f32 常驻") + ")");
         long t0 = System.currentTimeMillis();
         Qwen3Model model;
-        if (bf16) {
+        if (int8) {
+            Map<String, short[]> weights = SafetensorsLoader.loadBf16Bits(modelDir.resolve("model.safetensors"));
+            model = Qwen3Loader.loadInt8(cfg, weights);
+        } else if (bf16) {
             Map<String, short[]> weights = SafetensorsLoader.loadBf16Bits(modelDir.resolve("model.safetensors"));
             model = Qwen3Loader.loadBf16(cfg, weights);
         } else {
