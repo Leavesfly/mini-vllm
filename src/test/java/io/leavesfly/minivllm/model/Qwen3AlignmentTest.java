@@ -59,7 +59,7 @@ class Qwen3AlignmentTest {
                 "未找到 Qwen3-0.6B 模型目录");
         cfg = ModelConfig.fromConfigJson(SimpleJson.parseObject(
                 Files.readString(modelDir.resolve("config.json"))));
-        cfg.maxSeqLen = 2048;
+        cfg.maxSeqLen(2048);
         Map<String, float[]> weights = SafetensorsLoader.load(modelDir.resolve("model.safetensors"));
         model = Qwen3Loader.load(cfg, weights);
     }
@@ -96,8 +96,8 @@ class Qwen3AlignmentTest {
         Map<Integer, float[]> traced = new TreeMap<>();
         model.layerTrace = (layer, hidden) -> {
             if (traced.size() < 64) { // 防御性上限
-                float[] last = new float[cfg.dModel];
-                System.arraycopy(hidden, hidden.length - cfg.dModel, last, 0, cfg.dModel);
+                float[] last = new float[cfg.dModel()];
+                System.arraycopy(hidden, hidden.length - cfg.dModel(), last, 0, cfg.dModel());
                 traced.put(layer, last);
             }
         };
@@ -138,8 +138,8 @@ class Qwen3AlignmentTest {
 
     /** 引擎路径 greedy：prefill + 逐 token decode + argmax */
     private int[] greedyGenerate(int[] promptIds, int n) {
-        KVCacheManager kvMgr = new KVCacheManager(256, cfg.blockSize, cfg.kvDim());
-        BlockTable[] bts = new BlockTable[cfg.nLayer];
+        KVCacheManager kvMgr = new KVCacheManager(256, cfg.blockSize(), cfg.kvDim());
+        BlockTable[] bts = new BlockTable[cfg.nLayer()];
         for (int i = 0; i < bts.length; i++) {
             bts[i] = new BlockTable();
         }

@@ -18,11 +18,11 @@ import java.util.Deque;
 public final class BlockPool {
 
     /** 单个 block 能容纳的 token 数（vLLM 默认 16） */
-    public final int blockSize;
+    private final int blockSize;
     /** 模型隐藏层维度（每个 token 的 K/V 向量长度） */
-    public final int dModel;
+    private final int dModel;
     /** block 总数（= 模拟显存容量 / block 大小） */
-    public final int numBlocks;
+    private final int numBlocks;
 
     private final KVBlock[] blocks;
     /** 空闲 block id 队列 */
@@ -38,6 +38,18 @@ public final class BlockPool {
         for (int i = 0; i < numBlocks; i++) {
             freeList.add(i); // block 数组懒分配：首次 allocate 时才创建，避免启动即占满堆
         }
+    }
+
+    public int blockSize() {
+        return blockSize;
+    }
+
+    public int dModel() {
+        return dModel;
+    }
+
+    public int numBlocks() {
+        return numBlocks;
     }
 
     /**
@@ -94,6 +106,9 @@ public final class BlockPool {
     /**
      * 一个物理 block，承载 blockSize 个 token 的 K 与 V。
      * 数据布局：行优先 [blockSize, dModel]，token t 的 K 起始偏移 = t * dModel。
+     *
+     * 设计说明：k/v 数组故意暴露为 public final，因为 attention 层在 decode 热路径中
+     * 需要直接读写这些数组（避免方法调用开销）。这是性能与封装的有意识权衡。
      */
     public static final class KVBlock {
         public final int id;
@@ -109,11 +124,6 @@ public final class BlockPool {
 
         public int refCount() {
             return refCount;
-        }
-
-        /** token t 的 K 在数组中的起始偏移 */
-        public int kOffset(int t, int dModel) {
-            return t * dModel;
         }
     }
 }

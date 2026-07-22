@@ -17,45 +17,103 @@ package io.leavesfly.minivllm.model;
  */
 public final class ModelConfig {
 
-    public int vocabSize = 256;
-    public int dModel = 64;
-    public int nHead = 4;
-    public int nLayer = 2;
-    public int dFfn = 256;     // 4 * dModel
-    public int blockSize = 16; // PagedAttention 块大小
-    public int maxSeqLen = 512;
-    public float layerNormEps = 1e-5f;
-    public boolean tieWordEmbeddings = true; // GPT-2/GPT-3 词嵌入与 lm_head 共享权重
+    // 私有字段：统一经访问器读取，保证封装性
+    private int vocabSize = 256;
+    private int dModel = 64;
+    private int nHead = 4;
+    private int nLayer = 2;
+    private int dFfn = 256;     // 4 * dModel
+    private int blockSize = 16; // PagedAttention 块大小
+    private int maxSeqLen = 512;
+    private float layerNormEps = 1e-5f;
+    private boolean tieWordEmbeddings = true; // GPT-2/GPT-3 词嵌入与 lm_head 共享权重
 
-    // ---------- Qwen3 / 现代 LLM 架构字段 ----------
+    // ─── Qwen3 / 现代 LLM 架构字段 ───
     /** 架构标识："gpt2"（含 GPT-3 变体）或 "qwen3" */
-    public String arch = "gpt2";
+    private String arch = "gpt2";
     /** GQA 的 KV 头数；0 表示与 nHead 相同（即 MHA） */
-    public int nKVHead = 0;
+    private int nKVHead = 0;
     /** 显式注意力头维度；0 表示 dModel/nHead。Qwen3 为 128（与 dModel 无关） */
-    public int headDimExplicit = 0;
+    private int headDimExplicit = 0;
     /** RoPE 的 theta 基数（Qwen3 为 1000000） */
-    public float ropeTheta = 10000f;
+    private float ropeTheta = 10000f;
     /** RMSNorm 的 eps（Qwen3 为 1e-6） */
-    public float rmsNormEps = 1e-6f;
+    private float rmsNormEps = 1e-6f;
     /** EOS token id 集合（Qwen3 为 [151645, 151643]） */
-    public int[] eosTokenIds = new int[0];
+    private int[] eosTokenIds = new int[0];
 
-    // ---------- GPT-3 相关（相对 GPT-2 的唯一架构差异 + 规模预设）----------
+    // ─── GPT-3 相关（相对 GPT-2 的唯一架构差异 + 规模预设） ───
     /**
      * 是否启用交替「稠密 / 局部带状稀疏」注意力（GPT-3 的唯一架构区别）。
      * 关闭时即纯 GPT-2 稠密注意力。
      */
-    public boolean useSparseAttention = false;
+    private boolean useSparseAttention = false;
     /** 局部带状窗口：sparse 层每个 query 仅关注最近 sparseWindow 个 token */
-    public int sparseWindow = 128;
+    private int sparseWindow = 128;
     /** 模型名（便于打印/区分预设，如 "gpt3-small"） */
-    public String name = "mini";
+    private String name = "mini";
+
+    // ─── 访问器（无 get 前缀，与 headDim()/kvHeads() 风格一致） ───
+
+    public int vocabSize() { return vocabSize; }
+    public int dModel() { return dModel; }
+    public int nHead() { return nHead; }
+    public int nLayer() { return nLayer; }
+    public int dFfn() { return dFfn; }
+    public int blockSize() { return blockSize; }
+    public int maxSeqLen() { return maxSeqLen; }
+    public float layerNormEps() { return layerNormEps; }
+    public boolean tieWordEmbeddings() { return tieWordEmbeddings; }
+    public String arch() { return arch; }
+    public int nKVHead() { return nKVHead; }
+    public float ropeTheta() { return ropeTheta; }
+    public float rmsNormEps() { return rmsNormEps; }
+    public int[] eosTokenIds() { return eosTokenIds; }
+    public boolean useSparseAttention() { return useSparseAttention; }
+    public int sparseWindow() { return sparseWindow; }
+    public String name() { return name; }
+
+    /** 设置最大序列长度（外部裁剪上下文窗口时使用） */
+    public ModelConfig maxSeqLen(int value) { this.maxSeqLen = value; return this; }
+
+    // ─── 流式配置方法（返回 this 便于链式调用，主要用于测试与自定义构造） ───
+
+    /** 设置架构标识（"gpt2" 或 "qwen3"） */
+    public ModelConfig arch(String value) { this.arch = value; return this; }
+    /** 设置模型名称 */
+    public ModelConfig name(String value) { this.name = value; return this; }
+    /** 设置词表大小 */
+    public ModelConfig vocabSize(int value) { this.vocabSize = value; return this; }
+    /** 设置隐藏层维度 */
+    public ModelConfig dModel(int value) { this.dModel = value; return this; }
+    /** 设置注意力头数 */
+    public ModelConfig nHead(int value) { this.nHead = value; return this; }
+    /** 设置 KV 头数（GQA） */
+    public ModelConfig nKVHead(int value) { this.nKVHead = value; return this; }
+    /** 设置显式 headDim */
+    public ModelConfig headDimExplicit(int value) { this.headDimExplicit = value; return this; }
+    /** 设置层数 */
+    public ModelConfig nLayer(int value) { this.nLayer = value; return this; }
+    /** 设置 FFN 中间层维度 */
+    public ModelConfig dFfn(int value) { this.dFfn = value; return this; }
+    /** 设置 PagedAttention 块大小 */
+    public ModelConfig blockSize(int value) { this.blockSize = value; return this; }
+    /** 设置 RoPE theta 基数 */
+    public ModelConfig ropeTheta(float value) { this.ropeTheta = value; return this; }
+    /** 设置 RMSNorm eps */
+    public ModelConfig rmsNormEps(float value) { this.rmsNormEps = value; return this; }
+    /** 设置是否启用稀疏注意力 */
+    public ModelConfig useSparseAttention(boolean value) { this.useSparseAttention = value; return this; }
+    /** 设置稀疏窗口大小 */
+    public ModelConfig sparseWindow(int value) { this.sparseWindow = value; return this; }
 
     /** 每个注意力头的维度（Qwen3 用显式 headDim，否则 dModel/nHead） */
     public int headDim() {
         return headDimExplicit > 0 ? headDimExplicit : dModel / nHead;
     }
+
+    /** 显式 headDim 原始值（0 表示未设置） */
+    public int headDimExplicit() { return headDimExplicit; }
 
     /** KV 头数（GQA）；未设置时等于 nHead（MHA） */
     public int kvHeads() {
@@ -113,7 +171,7 @@ public final class ModelConfig {
         return c;
     }
 
-    // ---------- 标准 GPT-3 规模预设（vocab=50257, nCtx=2048, 需 BPE 分词与真实权重）----------
+    // ─── 标准 GPT-3 规模预设（vocab=50257, nCtx=2048, 需 BPE 分词与真实权重） ───
     // dFfn 均为 4*dModel；交替稠密/稀疏注意力默认开启。
 
     /** GPT-3 Small (125M)：L=12, d=768, h=12 */
@@ -178,14 +236,13 @@ public final class ModelConfig {
         c.rmsNormEps = floatOf(json, "rms_norm_eps", 1e-6f);
         c.tieWordEmbeddings = boolOf(json, "tie_word_embeddings", true);
         Object eos = json.get("eos_token_id");
-        if (eos instanceof java.util.List) {
-            java.util.List<?> list = (java.util.List<?>) eos;
+        if (eos instanceof java.util.List<?> list) {
             c.eosTokenIds = new int[list.size()];
             for (int i = 0; i < list.size(); i++) {
                 c.eosTokenIds[i] = ((Number) list.get(i)).intValue();
             }
-        } else if (eos instanceof Number) {
-            c.eosTokenIds = new int[]{((Number) eos).intValue()};
+        } else if (eos instanceof Number n) {
+            c.eosTokenIds = new int[]{n.intValue()};
         }
         return c;
     }

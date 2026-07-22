@@ -31,26 +31,13 @@ public final class SwiGluFfn {
      * gate+up 融合：单次 parallelRows 同时计算两路投影，x 只读一次、线程调度减半。
      */
     public float[] forward(float[] x) {
-        int dFfn = gate.outFeatures;
-        int in = gate.inFeatures;
+        int dFfn = gate.outFeatures();
         float[] gu = new float[dFfn]; // 复用为 gate 结果，然后就地 silu*up
 
         // 融合 gate+up：每个输出维度 i 同时算 gate[i] 和 up[i]
-        boolean int8 = gate.isInt8();
-        boolean bf16 = gate.isBf16();
         Matmul.parallelRows(dFfn, i -> {
-            int wOff = i * in;
-            float g, u;
-            if (int8) {
-                g = Matmul.dotInt8(gate.weightInt8, wOff, x, 0, in, gate.scaleInt8[i]);
-                u = Matmul.dotInt8(up.weightInt8, wOff, x, 0, in, up.scaleInt8[i]);
-            } else if (bf16) {
-                g = Matmul.dotBf16(gate.weightBf16, wOff, x, 0, in);
-                u = Matmul.dotBf16(up.weightBf16, wOff, x, 0, in);
-            } else {
-                g = Matmul.dot(gate.weight, wOff, x, 0, in);
-                u = Matmul.dot(up.weight, wOff, x, 0, in);
-            }
+            float g = gate.dotRow(x, 0, i);
+            float u = up.dotRow(x, 0, i);
             gu[i] = Silu.silu(g) * u;
         });
         return down.forward(gu);
@@ -61,27 +48,15 @@ public final class SwiGluFfn {
      * gate+up 融合：按输出通道并行，每个权重行只读一次并复用到全部 m 个输入行。
      */
     public float[] forwardBatch(float[] x, int seqLen) {
-        int dFfn = gate.outFeatures;
-        int in = gate.inFeatures;
+        int dFfn = gate.outFeatures();
+        int in = gate.inFeatures();
         float[] g = new float[seqLen * dFfn];
 
-        boolean int8 = gate.isInt8();
-        boolean bf16 = gate.isBf16();
         Matmul.parallelRows(dFfn, o -> {
-            int wOffG = o * in;
             for (int i = 0; i < seqLen; i++) {
                 int xOff = i * in;
-                float gv, uv;
-                if (int8) {
-                    gv = Matmul.dotInt8(gate.weightInt8, wOffG, x, xOff, in, gate.scaleInt8[o]);
-                    uv = Matmul.dotInt8(up.weightInt8, wOffG, x, xOff, in, up.scaleInt8[o]);
-                } else if (bf16) {
-                    gv = Matmul.dotBf16(gate.weightBf16, wOffG, x, xOff, in);
-                    uv = Matmul.dotBf16(up.weightBf16, wOffG, x, xOff, in);
-                } else {
-                    gv = Matmul.dot(gate.weight, wOffG, x, xOff, in);
-                    uv = Matmul.dot(up.weight, wOffG, x, xOff, in);
-                }
+                float gv = gate.dotRow(x, xOff, o);
+                float uv = up.dotRow(x, xOff, o);
                 g[i * dFfn + o] = Silu.silu(gv) * uv;
             }
         });

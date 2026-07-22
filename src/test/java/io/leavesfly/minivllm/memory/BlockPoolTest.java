@@ -81,15 +81,4 @@ class BlockPoolTest {
         assertEquals(blockSize * dModel, block.k.length);
         assertEquals(blockSize * dModel, block.v.length);
     }
-
-    @Test
-    void kOffsetCalculation() {
-        int dModel = 64;
-        BlockPool pool = new BlockPool(1, 16, dModel);
-        int id = pool.allocate();
-        BlockPool.KVBlock block = pool.get(id);
-        assertEquals(0, block.kOffset(0, dModel));
-        assertEquals(64, block.kOffset(1, dModel));
-        assertEquals(128, block.kOffset(2, dModel));
-    }
 }

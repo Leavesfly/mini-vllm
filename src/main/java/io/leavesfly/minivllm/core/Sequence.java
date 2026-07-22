@@ -5,6 +5,7 @@ import io.leavesfly.minivllm.tokenizer.BpeTokenizer;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.CountDownLatch;
 import java.util.function.Consumer;
 
 /**
@@ -20,25 +21,28 @@ public final class Sequence {
 
     public enum Stage { WAITING, PREFILL, DECODE, FINISHED, ABORTED }
 
-    public final int id;
-    public final int[] promptTokens;
-    public final List<Integer> outputTokens = new ArrayList<>();
+    private final int id;
+    private final int[] promptTokens;
+    private final List<Integer> outputTokens = new ArrayList<>();
     /** 每层一个 BlockTable（KV cache 按层独立） */
-    public final BlockTable[] blockTables;
-    public volatile Stage stage = Stage.WAITING;
+    private final BlockTable[] blockTables;
+    private volatile Stage stage = Stage.WAITING;
 
     // 生成参数（对应 OpenAI API）
-    public final int maxTokens;
-    public final float temperature;
-    public final int topK;
-    public final float topP;
-    public final int[] eosTokens; // 空数组表示无 EOS
+    private final int maxTokens;
+    private final float temperature;
+    private final int topK;
+    private final float topP;
+    private final int[] eosTokens; // 空数组表示无 EOS
 
     /** 流式回调：每生成一个 token 解码后触发 */
-    public final Consumer<String> onToken;
+    private final Consumer<String> onToken;
 
     /** BPE 分词时的流式增量解码器（由引擎注入，处理跨 token UTF-8 边界） */
-    public volatile BpeTokenizer.IncrementalDecoder incDecoder;
+    private volatile BpeTokenizer.IncrementalDecoder incDecoder;
+
+    /** 完成信号：请求结束时 countDown，等待方可用 awaitDone() 阻塞而非轮询 */
+    private final CountDownLatch done = new CountDownLatch(1);
 
     public Sequence(int id, int[] promptTokens, int maxTokens,
                     float temperature, int topK, float topP, int eosToken,
@@ -64,6 +68,65 @@ public final class Sequence {
         }
     }
 
+
+    // ─── 访问器 ───
+
+    public int id() {
+        return id;
+    }
+
+    public int[] promptTokens() {
+        return promptTokens;
+    }
+
+    public List<Integer> outputTokens() {
+        return outputTokens;
+    }
+
+    public BlockTable[] blockTables() {
+        return blockTables;
+    }
+
+    public Stage stage() {
+        return stage;
+    }
+
+    public void setStage(Stage stage) {
+        this.stage = stage;
+    }
+
+    public int maxTokens() {
+        return maxTokens;
+    }
+
+    public float temperature() {
+        return temperature;
+    }
+
+    public int topK() {
+        return topK;
+    }
+
+    public float topP() {
+        return topP;
+    }
+
+    public int[] eosTokens() {
+        return eosTokens;
+    }
+
+    public Consumer<String> onToken() {
+        return onToken;
+    }
+
+    public BpeTokenizer.IncrementalDecoder incDecoder() {
+        return incDecoder;
+    }
+
+    public void setIncDecoder(BpeTokenizer.IncrementalDecoder incDecoder) {
+        this.incDecoder = incDecoder;
+    }
+
     /** 已生成的 token 是否达到上限或命中 EOS */
     public boolean isFinished() {
         if (stage == Stage.FINISHED || stage == Stage.ABORTED) {
@@ -81,6 +144,16 @@ public final class Sequence {
             }
         }
         return false;
+    }
+
+    /** 标记完成（由引擎 sweep 时调用），触发等待方的 awaitDone() 返回 */
+    public void markDone() {
+        done.countDown();
+    }
+
+    /** 阻塞等待请求完成（替代 Thread.sleep 轮询） */
+    public void awaitDone() throws InterruptedException {
+        done.await();
     }
 
     /** 当前序列总 token 数 = prompt + 已生成 */

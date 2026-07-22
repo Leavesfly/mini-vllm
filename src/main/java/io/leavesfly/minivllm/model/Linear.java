@@ -16,13 +16,13 @@ import io.leavesfly.minivllm.math.Matmul;
  */
 public final class Linear {
 
-    public final float[] weight;        // [outFeatures, inFeatures] 行优先；bf16/int8 模式为 null
-    public final short[] weightBf16;    // bf16 位版权重；f32/int8 模式为 null
-    public final byte[] weightInt8;     // int8 量化权重；f32/bf16 模式为 null
-    public final float[] scaleInt8;     // int8 per-row 缩放因子 [outFeatures]；非 int8 模式为 null
-    public final float[] bias;          // [outFeatures]，可为 null
-    public final int inFeatures;
-    public final int outFeatures;
+    private final float[] weight;        // [outFeatures, inFeatures] 行优先；bf16/int8 模式为 null
+    private final short[] weightBf16;    // bf16 位版权重；f32/int8 模式为 null
+    private final byte[] weightInt8;     // int8 量化权重；f32/bf16 模式为 null
+    private final float[] scaleInt8;     // int8 per-row 缩放因子 [outFeatures]；非 int8 模式为 null
+    private final float[] bias;          // [outFeatures]，可为 null
+    private final int inFeatures;
+    private final int outFeatures;
 
     public Linear(float[] weight, float[] bias, int inFeatures, int outFeatures) {
         this(weight, null, null, null, bias, inFeatures, outFeatures);
@@ -39,6 +39,37 @@ public final class Linear {
         this.outFeatures = outFeatures;
     }
 
+
+    // ─── 访问器 ───
+
+    public float[] weight() {
+        return weight;
+    }
+
+    public short[] weightBf16() {
+        return weightBf16;
+    }
+
+    public byte[] weightInt8() {
+        return weightInt8;
+    }
+
+    public float[] scaleInt8() {
+        return scaleInt8;
+    }
+
+    public float[] bias() {
+        return bias;
+    }
+
+    public int inFeatures() {
+        return inFeatures;
+    }
+
+    public int outFeatures() {
+        return outFeatures;
+    }
+
     /** 是否为 bf16 常驻权重 */
     public boolean isBf16() {
         return weightBf16 != null;
@@ -47,6 +78,21 @@ public final class Linear {
     /** 是否为 int8 量化权重 */
     public boolean isInt8() {
         return weightInt8 != null;
+    }
+
+    /**
+     * 计算第 row 行权重与输入 x 的点积（封装 int8/bf16/f32 分派）。
+     * 用于 SwiGLU 等融合路径，避免外部重复判断权重类型。
+     */
+    public float dotRow(float[] x, int xOff, int row) {
+        int wOff = row * inFeatures;
+        if (weightInt8 != null) {
+            return Matmul.dotInt8(weightInt8, wOff, x, xOff, inFeatures, scaleInt8[row]);
+        } else if (weightBf16 != null) {
+            return Matmul.dotBf16(weightBf16, wOff, x, xOff, inFeatures);
+        } else {
+            return Matmul.dot(weight, wOff, x, xOff, inFeatures);
+        }
     }
 
     /** 单向量前向：x[inFeatures] -> y[outFeatures] */

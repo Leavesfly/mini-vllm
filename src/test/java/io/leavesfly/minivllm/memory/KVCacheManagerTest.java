@@ -92,11 +92,11 @@ class KVCacheManagerTest {
         KVCacheManager mgr = createManager();
         BlockTable bt = new BlockTable();
         mgr.ensureCapacity(bt, 8); // 2 blocks
-        assertEquals(NUM_BLOCKS - 2, mgr.pool.freeBlocks());
+        assertEquals(NUM_BLOCKS - 2, mgr.freeBlocks());
 
         mgr.free(bt);
         assertEquals(0, bt.numBlocks());
-        assertEquals(NUM_BLOCKS, mgr.pool.freeBlocks());
+        assertEquals(NUM_BLOCKS, mgr.freeBlocks());
     }
 
     @Test

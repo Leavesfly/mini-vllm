@@ -57,41 +57,41 @@ public final class Qwen3Attention {
         this.qNorm = qNorm;
         this.kNorm = kNorm;
         this.rope = rope;
-        this.nHead = cfg.nHead;
+        this.nHead = cfg.nHead();
         this.nKVHead = cfg.kvHeads();
         this.group = nHead / nKVHead;
         this.headDim = cfg.headDim();
         this.qDim = cfg.qDim();
         this.kvDim = cfg.kvDim();
-        this.blockSize = cfg.blockSize;
+        this.blockSize = cfg.blockSize();
         this.qkvDim = qDim + 2 * kvDim;
         this.fusedQKV = buildFusedQKV();
     }
 
     /** 拼接 q/k/v 权重为单个 Linear（支持 bf16/int8/f32 三种格式） */
     private Linear buildFusedQKV() {
-        int in = qProj.inFeatures;
+        int in = qProj.inFeatures();
         if (qProj.isBf16()) {
             short[] w = new short[qkvDim * in];
-            System.arraycopy(qProj.weightBf16, 0, w, 0, qDim * in);
-            System.arraycopy(kProj.weightBf16, 0, w, qDim * in, kvDim * in);
-            System.arraycopy(vProj.weightBf16, 0, w, (qDim + kvDim) * in, kvDim * in);
+            System.arraycopy(qProj.weightBf16(), 0, w, 0, qDim * in);
+            System.arraycopy(kProj.weightBf16(), 0, w, qDim * in, kvDim * in);
+            System.arraycopy(vProj.weightBf16(), 0, w, (qDim + kvDim) * in, kvDim * in);
             return Linear.ofBf16(w, in, qkvDim);
         } else if (qProj.isInt8()) {
             byte[] w = new byte[qkvDim * in];
             float[] s = new float[qkvDim];
-            System.arraycopy(qProj.weightInt8, 0, w, 0, qDim * in);
-            System.arraycopy(qProj.scaleInt8, 0, s, 0, qDim);
-            System.arraycopy(kProj.weightInt8, 0, w, qDim * in, kvDim * in);
-            System.arraycopy(kProj.scaleInt8, 0, s, qDim, kvDim);
-            System.arraycopy(vProj.weightInt8, 0, w, (qDim + kvDim) * in, kvDim * in);
-            System.arraycopy(vProj.scaleInt8, 0, s, qDim + kvDim, kvDim);
+            System.arraycopy(qProj.weightInt8(), 0, w, 0, qDim * in);
+            System.arraycopy(qProj.scaleInt8(), 0, s, 0, qDim);
+            System.arraycopy(kProj.weightInt8(), 0, w, qDim * in, kvDim * in);
+            System.arraycopy(kProj.scaleInt8(), 0, s, qDim, kvDim);
+            System.arraycopy(vProj.weightInt8(), 0, w, (qDim + kvDim) * in, kvDim * in);
+            System.arraycopy(vProj.scaleInt8(), 0, s, qDim + kvDim, kvDim);
             return Linear.ofInt8(w, s, in, qkvDim);
         } else {
             float[] w = new float[qkvDim * in];
-            System.arraycopy(qProj.weight, 0, w, 0, qDim * in);
-            System.arraycopy(kProj.weight, 0, w, qDim * in, kvDim * in);
-            System.arraycopy(vProj.weight, 0, w, (qDim + kvDim) * in, kvDim * in);
+            System.arraycopy(qProj.weight(), 0, w, 0, qDim * in);
+            System.arraycopy(kProj.weight(), 0, w, qDim * in, kvDim * in);
+            System.arraycopy(vProj.weight(), 0, w, (qDim + kvDim) * in, kvDim * in);
             return Linear.of(w, in, qkvDim);
         }
     }
@@ -216,11 +216,21 @@ public final class Qwen3Attention {
     }
 
     /**
-     * PagedAttention block-wise 累加：用已 QK-Norm+RoPE 的 q（位于 qBase）与 bt 中历史 KV
-     * 计算 GQA 注意力，写入 out 的 outBase 处。单次/批量 decode 共用此核心。
+     * PagedAttention block-wise 累加（Online Softmax / Flash-Decoding 风格）：
+     * 用已 QK-Norm+RoPE 的 q（位于 qBase）与 bt 中历史 KV 计算 GQA 注意力，
+     * 写入 out 的 outBase 处。单次/批量 decode 共用此核心。
      *
-     * 性能：多头并行（各头写 out 的不同区间，无数据竞争），
-     * 长上下文时 attention 计算量大，阈值降为 2 即并行。
+     * 性能优化（Online Softmax）：
+     * - 消除 float[totalTokens] 的 scores 数组分配（长上下文时可达数千 float），降低 GC 压力
+     * - 单遍扫描 KV cache（原实现需两遍：先算 score+softmax，再加权 V），带宽减半
+     * - 每头仅分配 float[headDim] 的临时输出缓冲，内存 O(headDim) 而非 O(totalTokens)
+     *
+     * 算法：维护 running max / sumExp / 未归一化输出，每遇到新 token 时：
+     *   1. 若 score > max，用 exp(oldMax - newMax) 修正已有累加
+     *   2. 累加 exp(score - max) * V 到输出
+     *   3. 最终除以 sumExp 归一化
+     *
+     * 多头并行：各头写 out 的不同区间，无数据竞争；长上下文阈值降为 2 即并行。
      */
     private void pagedAttention(float[] q, int qBase, float[] out, int outBase,
                                int curIdx, KVCacheManager kvMgr, BlockTable bt) {
@@ -232,34 +242,47 @@ public final class Qwen3Attention {
         Matmul.parallelRows(nHead, 2, h -> {
             int qOff = qBase + h * headDim;
             int kvOff = (h / group) * headDim; // GQA：Q 头 h 读 KV 头 h/group
-            // 第一遍：逐 block 累加 attention scores
-            float[] scores = new float[totalTokens];
+            int oOff = outBase + h * headDim;
+
+            // Online Softmax 状态：running max、sum(exp)、未归一化输出
+            float maxScore = Float.NEGATIVE_INFINITY;
+            float sumExp = 0f;
+            float[] headOut = new float[headDim]; // 临时累加缓冲
+
+            // 单遍扫描：逐 block、逐 token 同时计算 score 并累加 V
             for (int blk = 0; blk < nBlocks; blk++) {
                 float[] kBlk = kvMgr.blockK(bt, blk); // [blockSize, kvDim]
+                float[] vBlk = kvMgr.blockV(bt, blk); // [blockSize, kvDim]
                 int remain = totalTokens - blk * blockSize;
                 int tokensInBlock = Math.min(blockSize, Math.max(0, remain));
                 for (int s = 0; s < tokensInBlock; s++) {
                     int kOff = s * kvDim + kvOff;
-                    scores[blk * blockSize + s] = Matmul.dot(q, qOff, kBlk, kOff, headDim) * invSqrt;
+                    float score = Matmul.dot(q, qOff, kBlk, kOff, headDim) * invSqrt;
+                    if (score > maxScore) {
+                        // max 更新：修正已有累加（乘以 exp(oldMax - newMax)）
+                        float correction = (float) Math.exp(maxScore - score);
+                        sumExp *= correction;
+                        for (int d = 0; d < headDim; d++) {
+                            headOut[d] *= correction;
+                        }
+                        maxScore = score;
+                    }
+                    float w = (float) Math.exp(score - maxScore);
+                    sumExp += w;
+                    // 加权 V 累加（SIMD axpy）
+                    int vOff = s * kvDim + kvOff;
+                    Matmul.axpy(w, vBlk, vOff, headOut, 0, headDim);
                 }
             }
-            Softmax.softmaxInPlace(scores);
-            // 第二遍：逐 block 加权 V 累加输出（SIMD axpy）
-            int oOff = outBase + h * headDim;
-            for (int blk = 0; blk < nBlocks; blk++) {
-                float[] vBlk = kvMgr.blockV(bt, blk);
-                int remain = totalTokens - blk * blockSize;
-                int tokensInBlock = Math.min(blockSize, Math.max(0, remain));
-                for (int s = 0; s < tokensInBlock; s++) {
-                    int vOff = s * kvDim + kvOff;
-                    float w = scores[blk * blockSize + s];
-                    Matmul.axpy(w, vBlk, vOff, out, oOff, headDim);
-                }
+            // 归一化并写入 out
+            float invSum = 1f / sumExp;
+            for (int d = 0; d < headDim; d++) {
+                out[oOff + d] = headOut[d] * invSum;
             }
         });
     }
 
-    // ===================== 内部工具 =====================
+    // ─── 内部工具 ───
 
     /** QK-Norm（按头）后接 RoPE（按位置 pos），q/k 就地修改 */
     private void applyQkNormAndRope(float[] q, int qBase, float[] k, int kBase, int pos) {

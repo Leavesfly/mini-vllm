@@ -24,7 +24,7 @@ class SamplerTest {
     @Test
     void sampleWithVeryLowTempIsGreedy() {
         Sampler sampler = new Sampler(42L);
-        sampler.temperature = 0.001f;
+        sampler.configure(0.001f, 0, 1.0f);
         float[] logits = {1.0f, 5.0f, 3.0f, 2.0f};
         // 低温度退化为 greedy
         int result = sampler.sample(logits);
@@ -34,8 +34,7 @@ class SamplerTest {
     @Test
     void sampleWithTopK1IsGreedy() {
         Sampler sampler = new Sampler(42L);
-        sampler.topK = 1;
-        sampler.temperature = 1.0f;
+        sampler.configure(1.0f, 1, 1.0f);
         float[] logits = {1.0f, 5.0f, 3.0f, 2.0f};
         assertEquals(1, sampler.sample(logits));
     }
@@ -43,7 +42,7 @@ class SamplerTest {
     @Test
     void sampleReturnsValidIndex() {
         Sampler sampler = new Sampler(123L);
-        sampler.temperature = 1.0f;
+        sampler.configure(1.0f, 0, 1.0f);
         float[] logits = {1.0f, 2.0f, 3.0f, 4.0f, 5.0f};
         for (int i = 0; i < 100; i++) {
             int token = sampler.sample(logits);
@@ -55,8 +54,7 @@ class SamplerTest {
     @Test
     void sampleWithTopPLimitsDistribution() {
         Sampler sampler = new Sampler(42L);
-        sampler.temperature = 1.0f;
-        sampler.topP = 0.5f;
+        sampler.configure(1.0f, 0, 0.5f);
         // 给一个明显不均匀的分布，topP=0.5 应限制在概率大的区域
         float[] logits = {0f, 0f, 0f, 0f, 10f};
         int[] counts = new int[5];
@@ -71,9 +69,9 @@ class SamplerTest {
     void sampleDeterministicWithSameSeed() {
         float[] logits = {1f, 2f, 3f, 4f, 5f};
         Sampler s1 = new Sampler(999L);
-        s1.temperature = 0.8f;
+        s1.configure(0.8f, 0, 1.0f);
         Sampler s2 = new Sampler(999L);
-        s2.temperature = 0.8f;
+        s2.configure(0.8f, 0, 1.0f);
         // 相同种子应产生相同序列
         for (int i = 0; i < 20; i++) {
             assertEquals(s1.sample(logits.clone()), s2.sample(logits.clone()));

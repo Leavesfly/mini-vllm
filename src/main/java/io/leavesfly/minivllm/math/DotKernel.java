@@ -155,11 +155,26 @@ final class VectorDotKernel implements DotKernel {
 
     @Override
     public float dotInt8(byte[] w, int wOff, float[] x, int xOff, int len, float scale) {
-        // 注：在 128-bit SIMD 平台上，bf16 的 shift+reinterpret 是零开销寄存器内转换，
-        // int8 需要额外的符号扩展+整数转浮点，实际收益取决于平台带宽瓶颈。
-        // 大模型（>7B）或高并发场景下带宽受限时，int8 才有显著收益。
-        float sum = 0f;
-        for (int i = 0; i < len; i++) {
+        // 混合 SIMD 路径：标量 byte->float 转换（lanes 次操作在 L1 内）+ 向量 FMA 累加。
+        // 带宽收益：权重每元素仅 1 字节（bf16 为 2 字节），主循环内存读取减半；
+        // 转换开销极低（4 次 byte->float 在寄存器内完成），FMA 仍用 SIMD 宽通道。
+        int i = 0;
+        FloatVector acc = FloatVector.zero(SPECIES);
+        int lanes = SPECIES.length();
+        int bound = SPECIES.loopBound(len);
+        float[] tmp = new float[lanes]; // 小缓冲，逃逸优化后栈上分配
+        for (; i < bound; i += lanes) {
+            // 标量转换：lanes 个 int8 -> float（带宽节省的核心：只读 lanes 字节）
+            for (int j = 0; j < lanes; j++) {
+                tmp[j] = (float) w[wOff + i + j];
+            }
+            // SIMD FMA：与 bf16/f32 路径同构的向量乘加
+            FloatVector fv = FloatVector.fromArray(SPECIES, tmp, 0);
+            FloatVector xv = FloatVector.fromArray(SPECIES, x, xOff + i);
+            acc = fv.fma(xv, acc);
+        }
+        float sum = acc.reduceLanes(VectorOperators.ADD);
+        for (; i < len; i++) {
             sum += (float) w[wOff + i] * x[xOff + i];
         }
         return sum * scale;

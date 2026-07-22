@@ -35,7 +35,7 @@ class LLMEngineE2ETest {
     /** 构造一个可跑通的引擎（随机初始化模型 + 字节级分词器 + PagedAttention 内存池） */
     private static LLMEngine newEngine(ModelConfig cfg, int maxNumSeqs, int eosToken, long seed) {
         TransformerModel model = ModelLoader.randomInit(cfg);
-        KVCacheManager kvMgr = new KVCacheManager(512, cfg.blockSize, cfg.dModel);
+        KVCacheManager kvMgr = new KVCacheManager(512, cfg.blockSize(), cfg.dModel());
         ByteTokenizer tokenizer = new ByteTokenizer();
         return new LLMEngine(model, kvMgr, tokenizer, maxNumSeqs, eosToken, seed);
     }
@@ -67,9 +67,9 @@ class LLMEngineE2ETest {
         driveToCompletion(engine);
 
         assertTrue(seq.isFinished());
-        assertEquals(Sequence.Stage.FINISHED, seq.stage);
+        assertEquals(Sequence.Stage.FINISHED, seq.stage());
         // 无 EOS 时应恰好生成 maxTokens 个 token
-        assertEquals(maxTokens, seq.outputTokens.size());
+        assertEquals(maxTokens, seq.outputTokens().size());
     }
 
     @Test
@@ -94,7 +94,7 @@ class LLMEngineE2ETest {
         Sequence s2 = e2.addRequest("reproduce me", 10, 0f, 0, 1f, null);
         driveToCompletion(e2);
 
-        assertEquals(copy(s1.outputTokens), copy(s2.outputTokens),
+        assertEquals(copy(s1.outputTokens()), copy(s2.outputTokens()),
                 "greedy 解码在相同权重下应可复现（与采样随机种子无关）");
     }
 
@@ -106,9 +106,9 @@ class LLMEngineE2ETest {
         LLMEngine probe = newEngine(ModelConfig.small(), 2, -1, SEED);
         Sequence probeSeq = probe.addRequest("stop here", maxTokens, 0f, 0, 1f, null);
         driveToCompletion(probe);
-        assertEquals(maxTokens, probeSeq.outputTokens.size());
+        assertEquals(maxTokens, probeSeq.outputTokens().size());
         // 取 decode 阶段会产生的一个 token 作为 EOS（第 2 个生成 token）
-        int eos = probeSeq.outputTokens.get(1);
+        int eos = probeSeq.outputTokens().get(1);
 
         // 设置该 token 为 EOS，并给足额度；greedy 确定性 → 生成到该 token 即停止
         LLMEngine engine = newEngine(ModelConfig.small(), 2, eos, SEED);
@@ -116,8 +116,8 @@ class LLMEngineE2ETest {
         driveToCompletion(engine);
 
         assertTrue(seq.isFinished());
-        assertTrue(seq.outputTokens.size() < 100, "命中 EOS 应远早于 maxTokens 停止");
-        assertEquals(eos, seq.outputTokens.get(seq.outputTokens.size() - 1),
+        assertTrue(seq.outputTokens().size() < 100, "命中 EOS 应远早于 maxTokens 停止");
+        assertEquals(eos, seq.outputTokens().get(seq.outputTokens().size() - 1),
                 "停止时的最后一个 token 应为 EOS");
     }
 
@@ -136,11 +136,11 @@ class LLMEngineE2ETest {
         driveToCompletion(engine);
 
         for (Sequence seq : seqs) {
-            assertTrue(seq.isFinished(), "请求 " + seq.id + " 应已完成");
-            assertEquals(maxTokens, seq.outputTokens.size());
+            assertTrue(seq.isFinished(), "请求 " + seq.id() + " 应已完成");
+            assertEquals(maxTokens, seq.outputTokens().size());
         }
         // 完成后 running 队列应清空
-        assertTrue(engine.scheduler().running().isEmpty());
+        assertEquals(0, engine.scheduler().runningCount());
     }
 
     @Test
@@ -154,7 +154,7 @@ class LLMEngineE2ETest {
         driveToCompletion(engine);
 
         // 每生成一个 token 触发一次回调：回调次数 == 生成 token 数
-        assertEquals(seq.outputTokens.size(), streamed.size());
+        assertEquals(seq.outputTokens().size(), streamed.size());
         assertEquals(maxTokens, streamed.size());
     }
 
@@ -167,9 +167,9 @@ class LLMEngineE2ETest {
         Sequence seq = engine.addRequest("sample path", 12, 0.8f, 40, 0.9f, null);
         driveToCompletion(engine);
 
-        assertFalse(seq.outputTokens.isEmpty());
-        for (int tok : seq.outputTokens) {
-            assertTrue(tok >= 0 && tok < cfg.vocabSize,
+        assertFalse(seq.outputTokens().isEmpty());
+        for (int tok : seq.outputTokens()) {
+            assertTrue(tok >= 0 && tok < cfg.vocabSize(),
                     "采样 token 必须落在 [0, vocabSize) 内，实际=" + tok);
         }
     }
@@ -186,9 +186,9 @@ class LLMEngineE2ETest {
         driveToCompletion(engine);
 
         assertTrue(seq.isFinished());
-        assertEquals(maxTokens, seq.outputTokens.size());
-        for (int tok : seq.outputTokens) {
-            assertTrue(tok >= 0 && tok < cfg.vocabSize);
+        assertEquals(maxTokens, seq.outputTokens().size());
+        for (int tok : seq.outputTokens()) {
+            assertTrue(tok >= 0 && tok < cfg.vocabSize());
         }
     }
 
@@ -208,8 +208,8 @@ class LLMEngineE2ETest {
             }
 
             assertTrue(seq.isFinished(), "后台服务模式应在超时前完成请求");
-            assertEquals(5, seq.outputTokens.size());
-            assertEquals(seq.outputTokens.size(), streamed.size());
+            assertEquals(5, seq.outputTokens().size());
+            assertEquals(seq.outputTokens().size(), streamed.size());
         } finally {
             engine.stop();
         }

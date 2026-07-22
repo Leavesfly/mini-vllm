@@ -23,21 +23,20 @@ class Qwen3ModelTest {
 
     /** 小尺寸 Qwen3 配置：qDim(64) ≠ dModel(32)，GQA 4头/2KV头 */
     private static ModelConfig tinyQwen3() {
-        ModelConfig c = new ModelConfig();
-        c.arch = "qwen3";
-        c.name = "qwen3-tiny";
-        c.vocabSize = 50;
-        c.dModel = 32;
-        c.nHead = 4;
-        c.nKVHead = 2;
-        c.headDimExplicit = 16; // qDim = 4*16 = 64 ≠ dModel=32
-        c.nLayer = 2;
-        c.dFfn = 64;
-        c.blockSize = 4;
-        c.maxSeqLen = 64;
-        c.ropeTheta = 10000f;
-        c.rmsNormEps = 1e-6f;
-        return c;
+        return new ModelConfig()
+                .arch("qwen3")
+                .name("qwen3-tiny")
+                .vocabSize(50)
+                .dModel(32)
+                .nHead(4)
+                .nKVHead(2)
+                .headDimExplicit(16) // qDim = 4*16 = 64 ≠ dModel=32
+                .nLayer(2)
+                .dFfn(64)
+                .blockSize(4)
+                .maxSeqLen(64)
+                .ropeTheta(10000f)
+                .rmsNormEps(1e-6f);
     }
 
     @Test
@@ -58,15 +57,15 @@ class Qwen3ModelTest {
 
         // 路径 A：PyTorch 风格整段 forward
         Tensor all = model.forward(ids);
-        assertEquals(seqLen, all.shape[0]);
-        assertEquals(cfg.vocabSize, all.shape[1]);
+        assertEquals(seqLen, all.shape()[0]);
+        assertEquals(cfg.vocabSize(), all.shape()[1]);
 
         // 路径 B：引擎 prefill（一次性整段）
         KVCacheManager kvMgr = newKvMgr(cfg);
         BlockTable[] bts = newBlockTables(cfg);
         ensureCapacity(kvMgr, bts, seqLen);
         float[] prefillLast = model.prefillLogits(ids, kvMgr, bts, 0);
-        float[] forwardLast = row(all, seqLen - 1, cfg.vocabSize);
+        float[] forwardLast = row(all, seqLen - 1, cfg.vocabSize());
         assertArrayEquals(forwardLast, prefillLast, 1e-4f, "prefill 与 forward 最后位置不一致");
 
         // 路径 C：prefill 前 3 个 + 逐 token decode，逐位置与 forward 对比
@@ -77,7 +76,7 @@ class Qwen3ModelTest {
         model.prefillLogits(head, kvMgr2, bts2, 0);
         for (int t = 3; t < seqLen; t++) {
             float[] dec = model.decodeLogits(ids[t], t, kvMgr2, bts2);
-            assertArrayEquals(row(all, t, cfg.vocabSize), dec, 1e-4f,
+            assertArrayEquals(row(all, t, cfg.vocabSize()), dec, 1e-4f,
                     "decode 位置 " + t + " 与 forward 不一致");
         }
     }
@@ -86,17 +85,17 @@ class Qwen3ModelTest {
     void gqaSharesKvHeadsWithinGroup() {
         // nHead=2, nKVHead=1, headDim=4, dModel=8：两个 Q 头共享同一个 KV 头。
         // 把 qProj 的两个头行设为相同 -> 两个头的 attention 输出必须完全相同。
-        ModelConfig c = new ModelConfig();
-        c.arch = "qwen3";
-        c.vocabSize = 10;
-        c.dModel = 8;
-        c.nHead = 2;
-        c.nKVHead = 1;
-        c.headDimExplicit = 4;
-        c.nLayer = 1;
-        c.dFfn = 16;
-        c.blockSize = 4;
-        c.maxSeqLen = 16;
+        ModelConfig c = new ModelConfig()
+                .arch("qwen3")
+                .vocabSize(10)
+                .dModel(8)
+                .nHead(2)
+                .nKVHead(1)
+                .headDimExplicit(4)
+                .nLayer(1)
+                .dFfn(16)
+                .blockSize(4)
+                .maxSeqLen(16);
 
         Random rnd = new Random(7L);
         int dModel = 8, qDim = 8, kvDim = 4;
@@ -149,7 +148,7 @@ class Qwen3ModelTest {
     // ===================== 测试辅助 =====================
 
     private static KVCacheManager newKvMgr(ModelConfig cfg) {
-        return new KVCacheManager(64, cfg.blockSize, cfg.kvDim());
+        return new KVCacheManager(64, cfg.blockSize(), cfg.kvDim());
     }
 
     private static void ensureCapacity(KVCacheManager kvMgr, BlockTable[] bts, int tokens) {
@@ -159,7 +158,7 @@ class Qwen3ModelTest {
     }
 
     private static BlockTable[] newBlockTables(ModelConfig cfg) {
-        BlockTable[] bts = new BlockTable[cfg.nLayer];
+        BlockTable[] bts = new BlockTable[cfg.nLayer()];
         for (int i = 0; i < bts.length; i++) {
             bts[i] = new BlockTable();
         }
@@ -168,33 +167,33 @@ class Qwen3ModelTest {
 
     private static float[] row(Tensor t, int r, int width) {
         float[] out = new float[width];
-        System.arraycopy(t.data, r * width, out, 0, width);
+        System.arraycopy(t.data(), r * width, out, 0, width);
         return out;
     }
 
     /** 随机初始化一个小尺寸 Qwen3Model（std=0.02，与 ModelLoader 风格一致） */
     static Qwen3Model randomQwen3(ModelConfig cfg, long seed) {
         Random rnd = new Random(seed);
-        Embedding wte = new Embedding(randN(rnd, cfg.vocabSize * cfg.dModel, 0.02f),
-                cfg.vocabSize, cfg.dModel);
-        RotaryEmbedding rope = new RotaryEmbedding(cfg.headDim(), cfg.maxSeqLen, cfg.ropeTheta);
-        Qwen3Block[] blocks = new Qwen3Block[cfg.nLayer];
-        for (int i = 0; i < cfg.nLayer; i++) {
-            RmsNorm ln1 = rmsOnes(cfg.dModel, cfg.rmsNormEps);
-            RmsNorm ln2 = rmsOnes(cfg.dModel, cfg.rmsNormEps);
-            Linear q = Linear.of(randN(rnd, cfg.qDim() * cfg.dModel, 0.02f), cfg.dModel, cfg.qDim());
-            Linear k = Linear.of(randN(rnd, cfg.kvDim() * cfg.dModel, 0.02f), cfg.dModel, cfg.kvDim());
-            Linear v = Linear.of(randN(rnd, cfg.kvDim() * cfg.dModel, 0.02f), cfg.dModel, cfg.kvDim());
-            Linear o = Linear.of(randN(rnd, cfg.dModel * cfg.qDim(), 0.02f), cfg.qDim(), cfg.dModel);
-            RmsNorm qNorm = rmsOnes(cfg.headDim(), cfg.rmsNormEps);
-            RmsNorm kNorm = rmsOnes(cfg.headDim(), cfg.rmsNormEps);
+        Embedding wte = new Embedding(randN(rnd, cfg.vocabSize() * cfg.dModel(), 0.02f),
+                cfg.vocabSize(), cfg.dModel());
+        RotaryEmbedding rope = new RotaryEmbedding(cfg.headDim(), cfg.maxSeqLen(), cfg.ropeTheta());
+        Qwen3Block[] blocks = new Qwen3Block[cfg.nLayer()];
+        for (int i = 0; i < cfg.nLayer(); i++) {
+            RmsNorm ln1 = rmsOnes(cfg.dModel(), cfg.rmsNormEps());
+            RmsNorm ln2 = rmsOnes(cfg.dModel(), cfg.rmsNormEps());
+            Linear q = Linear.of(randN(rnd, cfg.qDim() * cfg.dModel(), 0.02f), cfg.dModel(), cfg.qDim());
+            Linear k = Linear.of(randN(rnd, cfg.kvDim() * cfg.dModel(), 0.02f), cfg.dModel(), cfg.kvDim());
+            Linear v = Linear.of(randN(rnd, cfg.kvDim() * cfg.dModel(), 0.02f), cfg.dModel(), cfg.kvDim());
+            Linear o = Linear.of(randN(rnd, cfg.dModel() * cfg.qDim(), 0.02f), cfg.qDim(), cfg.dModel());
+            RmsNorm qNorm = rmsOnes(cfg.headDim(), cfg.rmsNormEps());
+            RmsNorm kNorm = rmsOnes(cfg.headDim(), cfg.rmsNormEps());
             Qwen3Attention attn = new Qwen3Attention(cfg, q, k, v, o, qNorm, kNorm, rope);
-            Linear gate = Linear.of(randN(rnd, cfg.dFfn * cfg.dModel, 0.02f), cfg.dModel, cfg.dFfn);
-            Linear up = Linear.of(randN(rnd, cfg.dFfn * cfg.dModel, 0.02f), cfg.dModel, cfg.dFfn);
-            Linear down = Linear.of(randN(rnd, cfg.dModel * cfg.dFfn, 0.02f), cfg.dFfn, cfg.dModel);
-            blocks[i] = new Qwen3Block(ln1, ln2, attn, new SwiGluFfn(gate, up, down), cfg.dModel);
+            Linear gate = Linear.of(randN(rnd, cfg.dFfn() * cfg.dModel(), 0.02f), cfg.dModel(), cfg.dFfn());
+            Linear up = Linear.of(randN(rnd, cfg.dFfn() * cfg.dModel(), 0.02f), cfg.dModel(), cfg.dFfn());
+            Linear down = Linear.of(randN(rnd, cfg.dModel() * cfg.dFfn(), 0.02f), cfg.dFfn(), cfg.dModel());
+            blocks[i] = new Qwen3Block(ln1, ln2, attn, new SwiGluFfn(gate, up, down), cfg.dModel());
         }
-        return new Qwen3Model(cfg, wte, blocks, rmsOnes(cfg.dModel, cfg.rmsNormEps));
+        return new Qwen3Model(cfg, wte, blocks, rmsOnes(cfg.dModel(), cfg.rmsNormEps()));
     }
 
     private static RmsNorm rmsOnes(int dim, float eps) {

@@ -47,7 +47,7 @@ public final class TransformerModel implements LlmModel {
         this.wpe = wpe;
         this.blocks = blocks;
         this.lnF = lnF;
-        this.dModel = cfg.dModel;
+        this.dModel = cfg.dModel();
     }
 
     public int dModel() {
@@ -55,7 +55,7 @@ public final class TransformerModel implements LlmModel {
     }
 
     public int vocabSize() {
-        return cfg.vocabSize;
+        return cfg.vocabSize();
     }
 
     @Override
@@ -63,7 +63,7 @@ public final class TransformerModel implements LlmModel {
         return cfg;
     }
 
-    // ===================== 推理引擎对外接口（PagedAttention KV cache） =====================
+    // ─── 推理引擎对外接口（PagedAttention KV cache） ───
 
     /**
      * Prefill（引擎接口）：处理整段 prompt，写入 KV cache，返回最后一个位置的词表 logits。
@@ -93,7 +93,7 @@ public final class TransformerModel implements LlmModel {
         return logits(decode(tokenId, curIdx, kvMgr, bts));
     }
 
-    // ===================== 内部前向步骤（实现细节，不对外暴露） =====================
+    // ─── 内部前向步骤（实现细节，不对外暴露） ───
 
     /**
      * Prefill：处理整段 prompt。
@@ -126,7 +126,7 @@ public final class TransformerModel implements LlmModel {
         float[] x = wte.lookup(tokenId); // [d]
         int pOff = curIdx * dModel;
         for (int d = 0; d < dModel; d++) {
-            x[d] += wpe.weight[pOff + d];
+            x[d] += wpe.weight()[pOff + d];
         }
         for (int i = 0; i < blocks.length; i++) {
             x = blocks[i].decode(x, curIdx, kvMgr, bts[i]);
@@ -150,7 +150,7 @@ public final class TransformerModel implements LlmModel {
         return wte.projectToVocab(hidden);
     }
 
-    // ===================== PyTorch 风格对外接口 =====================
+    // ─── PyTorch 风格对外接口 ───
 
     /**
      * PyTorch 风格前向：输入 token id 序列，返回每个位置的词表 logits。
@@ -170,7 +170,7 @@ public final class TransformerModel implements LlmModel {
         }
         lnF.forwardRowsInPlace(x, seqLen);
         float[] logits = wte.projectToVocabBatch(x, seqLen);
-        return new Tensor(logits, seqLen, cfg.vocabSize);
+        return new Tensor(logits, seqLen, cfg.vocabSize());
     }
 
     /**
@@ -181,7 +181,7 @@ public final class TransformerModel implements LlmModel {
         int n = inputIds.size();
         int[] ids = new int[n];
         for (int i = 0; i < n; i++) {
-            ids[i] = (int) inputIds.data[i];
+            ids[i] = (int) inputIds.data()[i];
         }
         return forward(ids);
     }
@@ -190,8 +190,8 @@ public final class TransformerModel implements LlmModel {
     public float[] forwardLastLogits(int[] inputIds) {
         Tensor l = forward(inputIds);
         int seqLen = inputIds.length;
-        float[] last = new float[cfg.vocabSize];
-        System.arraycopy(l.data, (seqLen - 1) * cfg.vocabSize, last, 0, cfg.vocabSize);
+        float[] last = new float[cfg.vocabSize()];
+        System.arraycopy(l.data(), (seqLen - 1) * cfg.vocabSize(), last, 0, cfg.vocabSize());
         return last;
     }
 
@@ -213,7 +213,7 @@ public final class TransformerModel implements LlmModel {
         return blocks.length;
     }
 
-    // ===================== 内部工具 =====================
+    // ─── 内部工具 ───
 
     /** 词嵌入 + 位置嵌入：ids[seqLen] -> x[seqLen, dModel]，位置从 startIdx 起 */
     private float[] embed(int[] ids, int startIdx) {
@@ -223,7 +223,7 @@ public final class TransformerModel implements LlmModel {
             int pOff = (startIdx + t) * dModel;
             int xOff = t * dModel;
             for (int d = 0; d < dModel; d++) {
-                x[xOff + d] += wpe.weight[pOff + d];
+                x[xOff + d] += wpe.weight()[pOff + d];
             }
         }
         return x;

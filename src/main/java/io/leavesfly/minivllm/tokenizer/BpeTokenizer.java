@@ -143,7 +143,7 @@ public final class BpeTokenizer implements SimpleTokenizer {
         return out;
     }
 
-    // ===================== SimpleTokenizer 接口 =====================
+    // ─── SimpleTokenizer 接口 ───
 
     @Override
     public int[] encode(String text) {
@@ -191,7 +191,7 @@ public final class BpeTokenizer implements SimpleTokenizer {
         return new IncrementalDecoder(this);
     }
 
-    // ===================== 内部实现 =====================
+    // ─── 内部实现 ───
 
     private void encodeInto(String text, List<Integer> out) {
         if (text == null || text.isEmpty()) {
@@ -261,7 +261,6 @@ public final class BpeTokenizer implements SimpleTokenizer {
             i++;
         }
         i++; // 跳过 '{'
-        StringBuilder tok = new StringBuilder();
         while (i < len) {
             // 跳过空白与逗号
             while (i < len && (s.charAt(i) == ',' || Character.isWhitespace(s.charAt(i)))) {
@@ -274,39 +273,14 @@ public final class BpeTokenizer implements SimpleTokenizer {
             if (s.charAt(i) != '"') {
                 throw new IOException("vocab.json 格式错误 @" + i);
             }
-            i++;
-            tok.setLength(0);
-            while (true) {
-                char c = s.charAt(i++);
-                if (c == '"') {
-                    break;
-                }
-                if (c == '\\') {
-                    char esc = s.charAt(i++);
-                    switch (esc) {
-                        case '"': tok.append('"'); break;
-                        case '\\': tok.append('\\'); break;
-                        case '/': tok.append('/'); break;
-                        case 'n': tok.append('\n'); break;
-                        case 'r': tok.append('\r'); break;
-                        case 't': tok.append('\t'); break;
-                        case 'b': tok.append('\b'); break;
-                        case 'f': tok.append('\f'); break;
-                        case 'u':
-                            tok.append((char) Integer.parseInt(s.substring(i, i + 4), 16));
-                            i += 4;
-                            break;
-                        default: tok.append(esc);
-                    }
-                } else {
-                    tok.append(c);
-                }
-            }
-            // 冒号
+            i++; // 跳过开头引号
+            StringBuilder tok = new StringBuilder();
+            i = parseJsonString(s, i, tok);
+            // 跳过冒号与空白
             while (i < len && (s.charAt(i) == ':' || Character.isWhitespace(s.charAt(i)))) {
                 i++;
             }
-            // 数值 id
+            // 解析数值 id
             int id = 0;
             while (i < len && s.charAt(i) >= '0' && s.charAt(i) <= '9') {
                 id = id * 10 + (s.charAt(i++) - '0');
@@ -314,6 +288,36 @@ public final class BpeTokenizer implements SimpleTokenizer {
             map.put(tok.toString(), id);
         }
         return map;
+    }
+
+    /** 从位置 i 开始解析 JSON 字符串内容（处理转义），结果写入 out，返回结束引号后的位置 */
+    private static int parseJsonString(String s, int i, StringBuilder out) {
+        while (true) {
+            char c = s.charAt(i++);
+            if (c == '"') {
+                return i;
+            }
+            if (c == '\\') {
+                char esc = s.charAt(i++);
+                switch (esc) {
+                    case '"': out.append('"'); break;
+                    case '\\': out.append('\\'); break;
+                    case '/': out.append('/'); break;
+                    case 'n': out.append('\n'); break;
+                    case 'r': out.append('\r'); break;
+                    case 't': out.append('\t'); break;
+                    case 'b': out.append('\b'); break;
+                    case 'f': out.append('\f'); break;
+                    case 'u':
+                        out.append((char) Integer.parseInt(s.substring(i, i + 4), 16));
+                        i += 4;
+                        break;
+                    default: out.append(esc);
+                }
+            } else {
+                out.append(c);
+            }
+        }
     }
 
     /**

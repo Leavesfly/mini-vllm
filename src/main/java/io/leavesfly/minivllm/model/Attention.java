@@ -51,10 +51,10 @@ public final class Attention {
         this.kProj = kProj;
         this.vProj = vProj;
         this.oProj = oProj;
-        this.nHead = cfg.nHead;
+        this.nHead = cfg.nHead();
         this.headDim = cfg.headDim();
-        this.dModel = cfg.dModel;
-        this.blockSize = cfg.blockSize;
+        this.dModel = cfg.dModel();
+        this.blockSize = cfg.blockSize();
         this.sparse = sparse;
         this.window = window <= 0 ? Integer.MAX_VALUE : window;
     }

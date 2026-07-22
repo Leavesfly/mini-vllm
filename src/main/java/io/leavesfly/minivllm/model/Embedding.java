@@ -14,12 +14,12 @@ import io.leavesfly.minivllm.weights.Bf16;
  */
 public final class Embedding {
 
-    public final float[] weight;        // [vocabSize, dModel] 行优先；bf16/int8 模式为 null
-    public final short[] weightBf16;    // bf16 位版；f32/int8 模式为 null
-    public final byte[] weightInt8;     // int8 量化版；f32/bf16 模式为 null
-    public final float[] scaleInt8;     // int8 per-row scale [vocabSize]；非 int8 为 null
-    public final int vocabSize;
-    public final int dModel;
+    private final float[] weight;        // [vocabSize, dModel] 行优先；bf16/int8 模式为 null
+    private final short[] weightBf16;    // bf16 位版；f32/int8 模式为 null
+    private final byte[] weightInt8;     // int8 量化版；f32/bf16 模式为 null
+    private final float[] scaleInt8;     // int8 per-row scale [vocabSize]；非 int8 为 null
+    private final int vocabSize;
+    private final int dModel;
 
     public Embedding(float[] weight, int vocabSize, int dModel) {
         this(weight, null, null, null, vocabSize, dModel);
@@ -44,6 +44,15 @@ public final class Embedding {
     public static Embedding ofInt8(byte[] weightInt8, float[] scaleInt8, int vocabSize, int dModel) {
         return new Embedding(null, null, weightInt8, scaleInt8, vocabSize, dModel);
     }
+
+    // ─── 访问器（与 Linear 风格对齐） ───
+
+    public float[] weight() { return weight; }
+    public short[] weightBf16() { return weightBf16; }
+    public byte[] weightInt8() { return weightInt8; }
+    public float[] scaleInt8() { return scaleInt8; }
+    public int vocabSize() { return vocabSize; }
+    public int dModel() { return dModel; }
 
     /** 是否为 bf16 常驻权重 */
     public boolean isBf16() {

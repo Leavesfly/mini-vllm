@@ -11,13 +11,15 @@ package io.leavesfly.minivllm.math;
 public final class Tensor {
 
     /** 底层一维数据，行优先存储 */
-    public final float[] data;
+    private final float[] data;
     /** 形状，例如 {seqLen, dModel} */
-    public final int[] shape;
+    private final int[] shape;
 
     public Tensor(float[] data, int... shape) {
+        if (data == null) throw new IllegalArgumentException("data 不能为 null");
         int expect = 1;
         for (int s : shape) {
+            if (s <= 0) throw new IllegalArgumentException("shape 各维必须 > 0，得到 " + s);
             expect *= s;
         }
         if (expect != data.length && shape.length > 0) {
@@ -27,6 +29,12 @@ public final class Tensor {
         this.data = data;
         this.shape = shape;
     }
+
+    /** 底层一维数据（行优先存储） */
+    public float[] data() { return data; }
+
+    /** 形状数组 */
+    public int[] shape() { return shape; }
 
     /** 创建全零张量 */
     public static Tensor zeros(int... shape) {

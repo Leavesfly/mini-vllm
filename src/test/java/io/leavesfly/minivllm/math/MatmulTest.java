@@ -45,7 +45,7 @@ class MatmulTest {
         Tensor a = new Tensor(new float[]{1, 2, 3, 4, 5, 6}, 2, 3);
         Tensor b = new Tensor(new float[]{7, 8, 9, 10, 11, 12}, 3, 2);
         Tensor c = Matmul.matmul(a, b);
-        assertArrayEquals(new int[]{2, 2}, c.shape);
+        assertArrayEquals(new int[]{2, 2}, c.shape());
         assertEquals(58f, c.get2d(0, 0), EPS);
         assertEquals(154f, c.get2d(1, 1), EPS);
     }

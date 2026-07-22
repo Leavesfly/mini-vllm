@@ -32,6 +32,12 @@ import java.util.function.Consumer;
  */
 public final class LLMEngine {
 
+    // ─── 默认采样参数 ───
+
+    private static final float DEFAULT_TEMPERATURE = 0.8f;
+    private static final int DEFAULT_TOP_K = 0;
+    private static final float DEFAULT_TOP_P = 0.9f;
+
     private final LlmModel model;
     private final KVCacheManager kvMgr;
     private final SimpleTokenizer tokenizer;
@@ -57,7 +63,7 @@ public final class LLMEngine {
         this.kvMgr = kvMgr;
         this.tokenizer = tokenizer;
         this.cfg = model.config();
-        this.nLayer = cfg.nLayer;
+        this.nLayer = cfg.nLayer();
         this.eosTokens = eosTokens;
         this.sampler = new Sampler(seed);
         this.scheduler = new Scheduler(maxNumSeqs);
@@ -84,13 +90,13 @@ public final class LLMEngine {
                 temperature, topK, topP, eosTokens, nLayer, onToken);
         // BPE 分词时注入增量解码器，避免跨 token 的 UTF-8 截断乱码
         if (tokenizer instanceof BpeTokenizer) {
-            seq.incDecoder = ((BpeTokenizer) tokenizer).incrementalDecoder();
+            seq.setIncDecoder(((BpeTokenizer) tokenizer).incrementalDecoder());
         }
         scheduler.add(seq);
         return seq;
     }
 
-    // ===================== 调度循环 =====================
+    // ─── 调度循环 ───
 
     /** 执行一个调度步骤：admit → decode → sweep */
     public void step() {
@@ -98,20 +104,20 @@ public final class LLMEngine {
         decodeStep();
         sweepFinished();
         if (verbose) {
-            System.out.printf("[engine] running=%d waiting=%d freeBlocks=%d%n",
-                    scheduler.running().size(), scheduler.waiting().size(), kvMgr.pool.freeBlocks());
+            System.out.printf("[engine] running=%d waiting=%s freeBlocks=%d%n",
+                    scheduler.runningCount(), scheduler.waitingIsEmpty() ? "0" : "pending", kvMgr.freeBlocks());
         }
     }
 
     /** 接纳新请求：prefill 并加入 running */
     private void admitNew() {
-        while (scheduler.running().size() < scheduler.maxNumSeqs()) {
-            Sequence seq = scheduler.waiting().peek();
+        while (scheduler.runningCount() < scheduler.maxNumSeqs()) {
+            Sequence seq = scheduler.peekWaiting();
             if (seq == null) break;
-            int promptLen = seq.promptTokens.length;
+            int promptLen = seq.promptTokens().length;
             // 为每层分配 KV cache block
             boolean ok = true;
-            for (BlockTable bt : seq.blockTables) {
+            for (BlockTable bt : seq.blockTables()) {
                 if (!kvMgr.ensureCapacity(bt, promptLen)) {
                     ok = false;
                     break;
@@ -119,20 +125,20 @@ public final class LLMEngine {
             }
             if (!ok) {
                 // 显存不足：回滚已分配 block，留在 waiting 等下次（等 running 释放）
-                for (BlockTable bt : seq.blockTables) {
+                for (BlockTable bt : seq.blockTables()) {
                     if (bt.numBlocks() > 0) kvMgr.free(bt);
                 }
                 break;
             }
-            scheduler.waiting().poll(); // 正式取出
-            seq.stage = Sequence.Stage.PREFILL;
+            scheduler.pollWaiting(); // 正式取出
+            seq.setStage(Sequence.Stage.PREFILL);
             // prefill：一次性处理整段 prompt，写入 KV cache，生成第一个 token
-            float[] logits = model.prefillLogits(seq.promptTokens, kvMgr, seq.blockTables, 0);
+            float[] logits = model.prefillLogits(seq.promptTokens(), kvMgr, seq.blockTables(), 0);
             configureSampler(seq);
             int nextToken = sampler.sample(logits);
-            seq.outputTokens.add(nextToken);
-            seq.stage = Sequence.Stage.DECODE;
-            scheduler.running().add(seq);
+            seq.outputTokens().add(nextToken);
+            seq.setStage(Sequence.Stage.DECODE);
+            scheduler.addRunning(seq);
             emitToken(seq, nextToken);
         }
     }
@@ -141,18 +147,18 @@ public final class LLMEngine {
     private void decodeStep() {
         // 1. 收集处于 DECODE 且能扩容成功的序列（显存不足者置 ABORTED 并排除）
         List<Sequence> batch = new ArrayList<>();
-        for (Sequence seq : scheduler.running()) {
-            if (seq.stage != Sequence.Stage.DECODE) continue;
+        for (Sequence seq : scheduler.runningView()) {
+            if (seq.stage() != Sequence.Stage.DECODE) continue;
             int need = seq.totalLen(); // 新 token 的 K/V 需要落位，容量至少 curIdx+1
             boolean ok = true;
-            for (BlockTable bt : seq.blockTables) {
+            for (BlockTable bt : seq.blockTables()) {
                 if (!kvMgr.ensureCapacity(bt, need)) {
                     ok = false;
                     break;
                 }
             }
             if (!ok) {
-                seq.stage = Sequence.Stage.ABORTED; // 显存不足，中止（学习版不做 preemption）
+                seq.setStage(Sequence.Stage.ABORTED); // 显存不足，中止（学习版不做 preemption）
                 continue;
             }
             batch.add(seq);
@@ -166,9 +172,9 @@ public final class LLMEngine {
         BlockTable[][] bts = new BlockTable[b][];
         for (int i = 0; i < b; i++) {
             Sequence seq = batch.get(i);
-            lastTokens[i] = seq.outputTokens.get(seq.outputTokens.size() - 1);
+            lastTokens[i] = seq.outputTokens().get(seq.outputTokens().size() - 1);
             curIdxs[i] = seq.totalLen() - 1;
-            bts[i] = seq.blockTables;
+            bts[i] = seq.blockTables();
         }
 
         // 3. 批量前向 -> 每个序列的 logits
@@ -179,26 +185,27 @@ public final class LLMEngine {
             Sequence seq = batch.get(i);
             configureSampler(seq);
             int nextToken = sampler.sample(logits[i]);
-            seq.outputTokens.add(nextToken);
+            seq.outputTokens().add(nextToken);
             emitToken(seq, nextToken);
         }
     }
 
     /** 清扫完成/中止的请求，释放 KV cache */
     private void sweepFinished() {
-        scheduler.running().removeIf(seq -> {
+        scheduler.removeRunningIf(seq -> {
             if (seq.isFinished()) {
                 // 冲刷增量解码器中剩余的字节（不完整的 UTF-8 尾部）
-                if (seq.incDecoder != null && seq.onToken != null) {
-                    String rest = seq.incDecoder.flush();
+                if (seq.incDecoder() != null && seq.onToken() != null) {
+                    String rest = seq.incDecoder().flush();
                     if (!rest.isEmpty()) {
-                        seq.onToken.accept(rest);
+                        seq.onToken().accept(rest);
                     }
                 }
-                for (BlockTable bt : seq.blockTables) {
+                for (BlockTable bt : seq.blockTables()) {
                     kvMgr.free(bt);
                 }
-                seq.stage = Sequence.Stage.FINISHED;
+                seq.setStage(Sequence.Stage.FINISHED);
+                seq.markDone(); // 触发等待方的 awaitDone() 返回
                 return true;
             }
             return false;
@@ -206,33 +213,31 @@ public final class LLMEngine {
     }
 
     private void configureSampler(Sequence seq) {
-        sampler.temperature = seq.temperature;
-        sampler.topK = seq.topK;
-        sampler.topP = seq.topP;
+        sampler.configure(seq.temperature(), seq.topK(), seq.topP());
     }
 
     private void emitToken(Sequence seq, int token) {
-        if (seq.onToken == null) {
+        if (seq.onToken() == null) {
             return;
         }
         // EOS / 停止 token 不输出文本（否则 <|im_end|> 等会泄露到响应里，
         // 并在多轮对话中污染 ChatML 上下文）
-        for (int eos : seq.eosTokens) {
+        for (int eos : seq.eosTokens()) {
             if (token == eos) {
                 return;
             }
         }
-        if (seq.incDecoder != null) {
-            String piece = seq.incDecoder.accept(token);
+        if (seq.incDecoder() != null) {
+            String piece = seq.incDecoder().accept(token);
             if (!piece.isEmpty()) {
-                seq.onToken.accept(piece);
+                seq.onToken().accept(piece);
             }
         } else {
-            seq.onToken.accept(tokenizer.decode(new int[]{token}));
+            seq.onToken().accept(tokenizer.decode(new int[]{token}));
         }
     }
 
-    // ===================== 驱动模式 =====================
+    // ─── 驱动模式 ───
 
     /** 服务模式：独立线程持续 step */
     public void start() {
@@ -276,6 +281,6 @@ public final class LLMEngine {
 
     /** 默认参数同步生成 */
     public String generate(String prompt, int maxTokens) {
-        return generate(prompt, maxTokens, 0.8f, 0, 0.9f);
+        return generate(prompt, maxTokens, DEFAULT_TEMPERATURE, DEFAULT_TOP_K, DEFAULT_TOP_P);
     }
 }

@@ -171,9 +171,9 @@ public final class Matmul {
      * 输入为一维行优先数组。并行按输出行 m 分块。
      */
     public static float[] matmul(float[] a, int m, int k,
-                                 float[] b, int k2, int n) {
-        if (k != k2) {
-            throw new IllegalArgumentException("内部维度不匹配: " + k + " vs " + k2);
+                                 float[] b, int kB, int n) {
+        if (k != kB) {
+            throw new IllegalArgumentException("内部维度不匹配: " + k + " vs " + kB);
         }
         float[] c = new float[m * n];
         parallelRows(m, i -> {
@@ -194,9 +194,9 @@ public final class Matmul {
      * Tensor 版矩阵乘，A:[m,k] B:[k,n] -> C:[m,n]
      */
     public static Tensor matmul(Tensor a, Tensor b) {
-        int m = a.shape[0], k = a.shape[1];
-        int k2 = b.shape[0], n = b.shape[1];
-        float[] c = matmul(a.data, m, k, b.data, k2, n);
+        int m = a.shape()[0], k = a.shape()[1];
+        int k2 = b.shape()[0], n = b.shape()[1];
+        float[] c = matmul(a.data(), m, k, b.data(), k2, n);
         return new Tensor(c, m, n);
     }
 

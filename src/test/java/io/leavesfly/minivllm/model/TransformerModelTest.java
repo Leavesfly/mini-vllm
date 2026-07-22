@@ -19,8 +19,8 @@ import static org.junit.jupiter.api.Assertions.*;
 class TransformerModelTest {
 
     private static BlockTable[] newBlockTables(ModelConfig cfg, KVCacheManager kv, int promptLen) {
-        BlockTable[] bts = new BlockTable[cfg.nLayer];
-        for (int i = 0; i < cfg.nLayer; i++) {
+        BlockTable[] bts = new BlockTable[cfg.nLayer()];
+        for (int i = 0; i < cfg.nLayer(); i++) {
             bts[i] = new BlockTable();
             assertTrue(kv.ensureCapacity(bts[i], promptLen));
         }
@@ -35,9 +35,9 @@ class TransformerModelTest {
 
         Tensor logits = model.forward(prompt);
         assertEquals(2, logits.dim());
-        assertEquals(prompt.length, logits.shape[0]);
-        assertEquals(cfg.vocabSize, logits.shape[1]);
-        for (float v : logits.data) {
+        assertEquals(prompt.length, logits.shape()[0]);
+        assertEquals(cfg.vocabSize(), logits.shape()[1]);
+        for (float v : logits.data()) {
             assertTrue(Float.isFinite(v));
         }
     }
@@ -49,7 +49,7 @@ class TransformerModelTest {
         int[] prompt = {5, 9, 13, 2, 7, 100, 42};
 
         // 引擎路径：prefillLogits（走 PagedAttention KV cache，直接返回最后位置 logits）
-        KVCacheManager kv = new KVCacheManager(256, cfg.blockSize, cfg.dModel);
+        KVCacheManager kv = new KVCacheManager(256, cfg.blockSize(), cfg.dModel());
         BlockTable[] bts = newBlockTables(cfg, kv, prompt.length);
         float[] logitsPrefill = model.prefillLogits(prompt, kv, bts, 0);
 
@@ -69,27 +69,27 @@ class TransformerModelTest {
 
         Tensor a = model.forward(prompt);
         Tensor b = model.forward(new Tensor(new float[]{1f, 2f, 3f, 4f}, 4));
-        assertArrayEquals(a.data, b.data, 0f);
+        assertArrayEquals(a.data(), b.data(), 0f);
     }
 
     @Test
     void gpt3SparseModelRunsAndAlternatesLayers() {
         ModelConfig cfg = ModelConfig.gpt3Nano();
-        assertTrue(cfg.useSparseAttention);
+        assertTrue(cfg.useSparseAttention());
         // 交替：偶数层 dense，奇数层 sparse
         assertFalse(cfg.isSparseLayer(0));
         assertTrue(cfg.isSparseLayer(1));
         assertFalse(cfg.isSparseLayer(2));
 
         TransformerModel model = ModelLoader.randomInit(cfg);
-        assertEquals(cfg.nLayer, model.numLayers());
+        assertEquals(cfg.nLayer(), model.numLayers());
         assertTrue(model.numParameters() > 0);
 
         int[] prompt = {10, 20, 30, 40, 50, 60};
         Tensor logits = model.forward(prompt);
-        assertEquals(prompt.length, logits.shape[0]);
-        assertEquals(cfg.vocabSize, logits.shape[1]);
-        for (float v : logits.data) {
+        assertEquals(prompt.length, logits.shape()[0]);
+        assertEquals(cfg.vocabSize(), logits.shape()[1]);
+        for (float v : logits.data()) {
             assertTrue(Float.isFinite(v));
         }
     }
@@ -99,11 +99,11 @@ class TransformerModelTest {
         ModelConfig cfg = ModelConfig.gpt3Nano();
         TransformerModel model = ModelLoader.randomInit(cfg);
         // 用超过 sparseWindow 的序列，确保稀疏窗口被真正触发
-        int seqLen = cfg.sparseWindow + 5;
+        int seqLen = cfg.sparseWindow() + 5;
         int[] prompt = new int[seqLen];
-        for (int i = 0; i < seqLen; i++) prompt[i] = (i * 7 + 3) % cfg.vocabSize;
+        for (int i = 0; i < seqLen; i++) prompt[i] = (i * 7 + 3) % cfg.vocabSize();
 
-        KVCacheManager kv = new KVCacheManager(512, cfg.blockSize, cfg.dModel);
+        KVCacheManager kv = new KVCacheManager(512, cfg.blockSize(), cfg.dModel());
         BlockTable[] bts = newBlockTables(cfg, kv, seqLen);
         float[] logitsPrefill = model.prefillLogits(prompt, kv, bts, 0);
 

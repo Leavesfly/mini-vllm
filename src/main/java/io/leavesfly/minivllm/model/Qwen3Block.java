@@ -1,8 +1,11 @@
 package io.leavesfly.minivllm.model;
 
+import io.leavesfly.minivllm.math.ArrayUtil;
 import io.leavesfly.minivllm.math.RmsNorm;
 import io.leavesfly.minivllm.memory.BlockTable;
 import io.leavesfly.minivllm.memory.KVCacheManager;
+
+import java.util.function.UnaryOperator;
 
 /**
  * Qwen3Block —— Qwen3 的 Transformer 层（pre-norm 残差结构）。
@@ -15,8 +18,8 @@ import io.leavesfly.minivllm.memory.KVCacheManager;
  */
 public final class Qwen3Block {
 
-    private final RmsNorm ln1;      // input_layernorm
-    private final RmsNorm ln2;      // post_attention_layernorm
+    private final RmsNorm inputNorm;      // input_layernorm
+    private final RmsNorm postAttnNorm;   // post_attention_layernorm
     private final Qwen3Attention attn;
     private final SwiGluFfn ffn;
     private final int dModel;
@@ -28,9 +31,9 @@ public final class Qwen3Block {
     private final float[] hBuf;
     private final float[] h2Buf;
 
-    public Qwen3Block(RmsNorm ln1, RmsNorm ln2, Qwen3Attention attn, SwiGluFfn ffn, int dModel) {
-        this.ln1 = ln1;
-        this.ln2 = ln2;
+    public Qwen3Block(RmsNorm inputNorm, RmsNorm postAttnNorm, Qwen3Attention attn, SwiGluFfn ffn, int dModel) {
+        this.inputNorm = inputNorm;
+        this.postAttnNorm = postAttnNorm;
         this.attn = attn;
         this.ffn = ffn;
         this.dModel = dModel;
@@ -40,29 +43,22 @@ public final class Qwen3Block {
 
     /** Prefill：x[seqLen, dModel] -> y[seqLen, dModel] */
     public float[] prefill(float[] x, int seqLen, KVCacheManager kvMgr, BlockTable bt, int startIdx) {
-        float[] h = x.clone();
-        ln1.forwardRowsInPlace(h, seqLen);
-        float[] a = attn.prefill(h, seqLen, kvMgr, bt, startIdx);
-        for (int i = 0; i < x.length; i++) x[i] += a[i];
-
-        float[] h2 = x.clone();
-        ln2.forwardRowsInPlace(h2, seqLen);
-        float[] f = ffn.forwardBatch(h2, seqLen);
-        for (int i = 0; i < x.length; i++) x[i] += f[i];
+        applyResidual(x, seqLen, inputNorm, h -> attn.prefill(h, seqLen, kvMgr, bt, startIdx));
+        applyResidual(x, seqLen, postAttnNorm, h -> ffn.forwardBatch(h, seqLen));
         return x;
     }
 
     /** Decode：x[dModel] -> y[dModel]（单 token，复用预分配缓冲避免 GC） */
     public float[] decode(float[] x, int curIdx, KVCacheManager kvMgr, BlockTable bt) {
         System.arraycopy(x, 0, hBuf, 0, dModel);
-        ln1.forwardInPlace(hBuf);
+        inputNorm.forwardInPlace(hBuf);
         float[] a = attn.decodePaged(hBuf, curIdx, kvMgr, bt);
-        for (int i = 0; i < dModel; i++) x[i] += a[i];
+        ArrayUtil.addInPlace(x, a);
 
         System.arraycopy(x, 0, h2Buf, 0, dModel);
-        ln2.forwardInPlace(h2Buf);
+        postAttnNorm.forwardInPlace(h2Buf);
         float[] f = ffn.forward(h2Buf);
-        for (int i = 0; i < dModel; i++) x[i] += f[i];
+        ArrayUtil.addInPlace(x, f);
         return x;
     }
 
@@ -72,35 +68,28 @@ public final class Qwen3Block {
      */
     public float[] decodeBatch(float[] x, int batch, int[] curIdxs,
                                KVCacheManager kvMgr, BlockTable[] bts) {
-        float[] h = x.clone();
-        ln1.forwardRowsInPlace(h, batch);
-        float[] a = attn.decodeBatch(h, batch, curIdxs, kvMgr, bts); // [B, dModel]
-        for (int i = 0; i < x.length; i++) x[i] += a[i];
-
-        float[] h2 = x.clone();
-        ln2.forwardRowsInPlace(h2, batch);
-        float[] f = ffn.forwardBatch(h2, batch);
-        for (int i = 0; i < x.length; i++) x[i] += f[i];
+        applyResidual(x, batch, inputNorm, h -> attn.decodeBatch(h, batch, curIdxs, kvMgr, bts));
+        applyResidual(x, batch, postAttnNorm, h -> ffn.forwardBatch(h, batch));
         return x;
     }
 
     /** 纯前向（无 KV cache）：x[seqLen, dModel] -> y[seqLen, dModel] */
     public float[] forward(float[] x, int seqLen) {
-        float[] h = x.clone();
-        ln1.forwardRowsInPlace(h, seqLen);
-        float[] a = attn.forwardDense(h, seqLen);
-        for (int i = 0; i < x.length; i++) x[i] += a[i];
-
-        float[] h2 = x.clone();
-        ln2.forwardRowsInPlace(h2, seqLen);
-        float[] f = ffn.forwardBatch(h2, seqLen);
-        for (int i = 0; i < x.length; i++) x[i] += f[i];
+        applyResidual(x, seqLen, inputNorm, h -> attn.forwardDense(h, seqLen));
+        applyResidual(x, seqLen, postAttnNorm, h -> ffn.forwardBatch(h, seqLen));
         return x;
     }
 
-    /** 参数量（ln1 + ln2 + attn + ffn） */
+    /** 残差子步骤：clone → norm → sublayer → 累加回 x */
+    private void applyResidual(float[] x, int rows, RmsNorm norm, UnaryOperator<float[]> sublayer) {
+        float[] h = x.clone();
+        norm.forwardRowsInPlace(h, rows);
+        ArrayUtil.addInPlace(x, sublayer.apply(h));
+    }
+
+    /** 参数量（inputNorm + postAttnNorm + attn + ffn） */
     public long numParameters() {
-        return ln1.numParameters() + ln2.numParameters()
+        return inputNorm.numParameters() + postAttnNorm.numParameters()
                 + attn.numParameters() + ffn.numParameters();
     }
 }

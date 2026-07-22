@@ -17,12 +17,19 @@ import java.util.Random;
 public final class Sampler {
 
     private final Random random;
-    public float temperature = 1.0f;
-    public int topK = 0;   // 0 表示不限制
-    public float topP = 1.0f; // 1.0 表示不限制
+    private float temperature = 1.0f;
+    private int topK = 0;      // 0 表示不限制
+    private float topP = 1.0f; // 1.0 表示不限制
 
     public Sampler(long seed) {
         this.random = new Random(seed);
+    }
+
+    /** 配置采样参数（由引擎在每次采样前调用） */
+    public void configure(float temperature, int topK, float topP) {
+        this.temperature = temperature;
+        this.topK = topK;
+        this.topP = topP;
     }
 
     /** greedy：返回最大 logits 的下标 */

@@ -44,7 +44,7 @@ public final class Benchmark {
 
         ModelConfig cfg = ModelConfig.fromConfigJson(SimpleJson.parseObject(
                 Files.readString(modelDir.resolve("config.json"))));
-        cfg.maxSeqLen = 2048;
+        cfg.maxSeqLen(2048);
         boolean int8 = Boolean.getBoolean("weights.int8");
         boolean bf16 = Boolean.getBoolean("weights.bf16") || int8; // int8 从 bf16 量化而来
         System.out.println("加载权重... (" + (int8 ? "int8 量化" : bf16 ? "bf16 常驻" : "f32 常驻") + ")");
@@ -78,7 +78,7 @@ public final class Benchmark {
         long start = System.nanoTime();
         int iters = 5;
         for (int i = 0; i < iters; i++) {
-            KVCacheManager kvMgr = new KVCacheManager(512, cfg.blockSize, cfg.kvDim());
+            KVCacheManager kvMgr = new KVCacheManager(512, cfg.blockSize(), cfg.kvDim());
             BlockTable[] bts = newTables(cfg);
             ensure(kvMgr, bts, prompt.length + DECODE_TOKENS);
             model.prefillLogits(prompt, kvMgr, bts, 0);
@@ -107,11 +107,11 @@ public final class Benchmark {
 
     /** 批量 decode 聚合吞吐（仅计 decode 阶段，不含 prefill），返回总 tok/s */
     private static double runDecodeBatchThroughput(Qwen3Model model, ModelConfig cfg, int[] prompt, int batch, int n) {
-        KVCacheManager kvMgr = new KVCacheManager(4096, cfg.blockSize, cfg.kvDim());
-        BlockTable[][] bts = new BlockTable[batch][cfg.nLayer];
+        KVCacheManager kvMgr = new KVCacheManager(4096, cfg.blockSize(), cfg.kvDim());
+        BlockTable[][] bts = new BlockTable[batch][cfg.nLayer()];
         float[][] logits = new float[batch][];
         for (int b = 0; b < batch; b++) {
-            for (int i = 0; i < cfg.nLayer; i++) {
+            for (int i = 0; i < cfg.nLayer(); i++) {
                 bts[b][i] = new BlockTable();
             }
             for (BlockTable bt : bts[b]) {
@@ -137,7 +137,7 @@ public final class Benchmark {
 
     /** 返回实际生成的 token 数 */
     private static int runDecode(Qwen3Model model, ModelConfig cfg, int[] prompt, int n) {
-        KVCacheManager kvMgr = new KVCacheManager(512, cfg.blockSize, cfg.kvDim());
+        KVCacheManager kvMgr = new KVCacheManager(512, cfg.blockSize(), cfg.kvDim());
         BlockTable[] bts = newTables(cfg);
         ensure(kvMgr, bts, prompt.length + n);
         float[] logits = model.prefillLogits(prompt, kvMgr, bts, 0);
@@ -153,7 +153,7 @@ public final class Benchmark {
     }
 
     private static BlockTable[] newTables(ModelConfig cfg) {
-        BlockTable[] bts = new BlockTable[cfg.nLayer];
+        BlockTable[] bts = new BlockTable[cfg.nLayer()];
         for (int i = 0; i < bts.length; i++) {
             bts[i] = new BlockTable();
         }

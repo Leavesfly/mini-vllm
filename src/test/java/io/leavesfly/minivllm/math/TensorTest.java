@@ -15,7 +15,7 @@ class TensorTest {
         Tensor t = new Tensor(data, 2, 3);
         assertEquals(6, t.size());
         assertEquals(2, t.dim());
-        assertArrayEquals(new int[]{2, 3}, t.shape);
+        assertArrayEquals(new int[]{2, 3}, t.shape());
     }
 
     @Test
@@ -28,7 +28,7 @@ class TensorTest {
     void zerosCreatesAllZeroTensor() {
         Tensor t = Tensor.zeros(3, 4);
         assertEquals(12, t.size());
-        for (float v : t.data) {
+        for (float v : t.data()) {
             assertEquals(0f, v);
         }
     }

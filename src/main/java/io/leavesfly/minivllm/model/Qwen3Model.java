@@ -30,18 +30,18 @@ public final class Qwen3Model implements LlmModel {
     private final ModelConfig cfg;
     private final Embedding wte; // embed_tokens [vocab, dModel]，tied 时兼作 lm_head
     private final Qwen3Block[] blocks;
-    private final RmsNorm lnF;   // model.norm
+    private final RmsNorm finalNorm;   // model.norm
     private final int dModel;
 
     /** debug：非 null 时，每层 block 输出后回调（layerIdx, hidden 拷贝） */
     public volatile BiConsumer<Integer, float[]> layerTrace = null;
 
-    public Qwen3Model(ModelConfig cfg, Embedding wte, Qwen3Block[] blocks, RmsNorm lnF) {
+    public Qwen3Model(ModelConfig cfg, Embedding wte, Qwen3Block[] blocks, RmsNorm finalNorm) {
         this.cfg = cfg;
         this.wte = wte;
         this.blocks = blocks;
-        this.lnF = lnF;
-        this.dModel = cfg.dModel;
+        this.finalNorm = finalNorm;
+        this.dModel = cfg.dModel();
     }
 
     @Override
@@ -54,14 +54,14 @@ public final class Qwen3Model implements LlmModel {
     }
 
     public int vocabSize() {
-        return cfg.vocabSize;
+        return cfg.vocabSize();
     }
 
     public int numLayers() {
         return blocks.length;
     }
 
-    // ===================== 推理引擎接口（PagedAttention KV cache） =====================
+    // ─── 推理引擎接口（PagedAttention KV cache） ───
 
     @Override
     public float[] prefillLogits(int[] tokenIds, KVCacheManager kvMgr, BlockTable[] bts, int startIdx) {
@@ -97,12 +97,12 @@ public final class Qwen3Model implements LlmModel {
             x = blocks[i].decodeBatch(x, batch, curIdxs, kvMgr, layerBts);
             trace(i, x);
         }
-        lnF.forwardRowsInPlace(x, batch);
+        finalNorm.forwardRowsInPlace(x, batch);
         // 3. 融合 lm_head：一次 parallelRows 完成 B 个序列的词表投影，权重跨 B 复用
         return wte.projectToVocabFused(x, batch);
     }
 
-    // ===================== 内部前向 =====================
+    // ─── 内部前向 ───
 
     private float[] prefill(int[] tokenIds, KVCacheManager kvMgr, BlockTable[] bts, int startIdx) {
         int seqLen = tokenIds.length;
@@ -111,7 +111,7 @@ public final class Qwen3Model implements LlmModel {
             x = blocks[i].prefill(x, seqLen, kvMgr, bts[i], startIdx);
             trace(i, x);
         }
-        lnF.forwardRowsInPlace(x, seqLen);
+        finalNorm.forwardRowsInPlace(x, seqLen);
         return x;
     }
 
@@ -121,7 +121,7 @@ public final class Qwen3Model implements LlmModel {
             x = blocks[i].decode(x, curIdx, kvMgr, bts[i]);
             trace(i, x);
         }
-        lnF.forwardInPlace(x);
+        finalNorm.forwardInPlace(x);
         return x;
     }
 
@@ -143,7 +143,7 @@ public final class Qwen3Model implements LlmModel {
         }
     }
 
-    // ===================== PyTorch 风格接口 =====================
+    // ─── PyTorch 风格接口 ───
 
     /**
      * PyTorch 风格前向：输入 token id 序列，返回每个位置的词表 logits。
@@ -156,17 +156,17 @@ public final class Qwen3Model implements LlmModel {
             x = blocks[i].forward(x, seqLen);
             trace(i, x);
         }
-        lnF.forwardRowsInPlace(x, seqLen);
+        finalNorm.forwardRowsInPlace(x, seqLen);
         float[] logits = wte.projectToVocabBatch(x, seqLen);
-        return new Tensor(logits, seqLen, cfg.vocabSize);
+        return new Tensor(logits, seqLen, cfg.vocabSize());
     }
 
     /** 便捷：整段前向后仅取最后一个位置的 logits */
     public float[] forwardLastLogits(int[] inputIds) {
         Tensor l = forward(inputIds);
         int seqLen = inputIds.length;
-        float[] last = new float[cfg.vocabSize];
-        System.arraycopy(l.data, (seqLen - 1) * cfg.vocabSize, last, 0, cfg.vocabSize);
+        float[] last = new float[cfg.vocabSize()];
+        System.arraycopy(l.data(), (seqLen - 1) * cfg.vocabSize(), last, 0, cfg.vocabSize());
         return last;
     }
 
@@ -181,7 +181,7 @@ public final class Qwen3Model implements LlmModel {
             x = blocks[i].forward(x, seqLen);
             trace(i, x);
         }
-        lnF.forwardRowsInPlace(x, seqLen);
+        finalNorm.forwardRowsInPlace(x, seqLen);
         float[] last = new float[dModel];
         System.arraycopy(x, (seqLen - 1) * dModel, last, 0, dModel);
         return last;
@@ -193,7 +193,7 @@ public final class Qwen3Model implements LlmModel {
         for (Qwen3Block b : blocks) {
             n += b.numParameters();
         }
-        n += lnF.numParameters();
+        n += finalNorm.numParameters();
         return n;
     }
 }

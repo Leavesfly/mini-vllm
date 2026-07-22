@@ -1,6 +1,7 @@
 package io.leavesfly.minivllm.weights;
 
 import io.leavesfly.minivllm.model.*;
+import io.leavesfly.minivllm.math.ArrayUtil;
 import io.leavesfly.minivllm.math.LayerNorm;
 import io.leavesfly.minivllm.model.TransformerModel;
 
@@ -38,28 +39,28 @@ public final class ModelLoader {
 
     /** 从 safetensors 加载的权重字典构造 TransformerModel */
     public static TransformerModel load(ModelConfig cfg, Map<String, float[]> weights) {
-        Embedding wteE = new Embedding(get(weights, "wte.weight", cfg.vocabSize * cfg.dModel),
-                cfg.vocabSize, cfg.dModel);
-        Embedding wpeE = new Embedding(get(weights, "wpe.weight", cfg.maxSeqLen * cfg.dModel),
-                cfg.maxSeqLen, cfg.dModel);
+        Embedding wteE = new Embedding(get(weights, "wte.weight", cfg.vocabSize() * cfg.dModel()),
+                cfg.vocabSize(), cfg.dModel());
+        Embedding wpeE = new Embedding(get(weights, "wpe.weight", cfg.maxSeqLen() * cfg.dModel()),
+                cfg.maxSeqLen(), cfg.dModel());
 
-        TransformerBlock[] blocks = new TransformerBlock[cfg.nLayer];
-        for (int i = 0; i < cfg.nLayer; i++) {
+        TransformerBlock[] blocks = new TransformerBlock[cfg.nLayer()];
+        for (int i = 0; i < cfg.nLayer(); i++) {
             String p = "h." + i + ".";
-            LayerNorm ln1 = layerNorm(weights, p + "ln_1", cfg.dModel, cfg.layerNormEps);
-            LayerNorm ln2 = layerNorm(weights, p + "ln_2", cfg.dModel, cfg.layerNormEps);
-            Linear q = linear(weights, p + "attn.q_proj", cfg.dModel, cfg.dModel);
-            Linear k = linear(weights, p + "attn.k_proj", cfg.dModel, cfg.dModel);
-            Linear v = linear(weights, p + "attn.v_proj", cfg.dModel, cfg.dModel);
-            Linear o = linear(weights, p + "attn.o_proj", cfg.dModel, cfg.dModel);
+            LayerNorm ln1 = layerNorm(weights, p + "ln_1", cfg.dModel(), cfg.layerNormEps());
+            LayerNorm ln2 = layerNorm(weights, p + "ln_2", cfg.dModel(), cfg.layerNormEps());
+            Linear q = linear(weights, p + "attn.q_proj", cfg.dModel(), cfg.dModel());
+            Linear k = linear(weights, p + "attn.k_proj", cfg.dModel(), cfg.dModel());
+            Linear v = linear(weights, p + "attn.v_proj", cfg.dModel(), cfg.dModel());
+            Linear o = linear(weights, p + "attn.o_proj", cfg.dModel(), cfg.dModel());
             // GPT-3 交替：奇数层用局部带状稀疏注意力，偶数层 dense
-            Attention attn = new Attention(cfg, q, k, v, o, cfg.isSparseLayer(i), cfg.sparseWindow);
-            Linear fc1 = linear(weights, p + "mlp.fc1", cfg.dModel, cfg.dFfn);
-            Linear fc2 = linear(weights, p + "mlp.fc2", cfg.dFfn, cfg.dModel);
+            Attention attn = new Attention(cfg, q, k, v, o, cfg.isSparseLayer(i), cfg.sparseWindow());
+            Linear fc1 = linear(weights, p + "mlp.fc1", cfg.dModel(), cfg.dFfn());
+            Linear fc2 = linear(weights, p + "mlp.fc2", cfg.dFfn(), cfg.dModel());
             Ffn ffn = new Ffn(fc1, fc2);
-            blocks[i] = new TransformerBlock(ln1, ln2, attn, ffn, cfg.dModel);
+            blocks[i] = new TransformerBlock(ln1, ln2, attn, ffn, cfg.dModel());
         }
-        LayerNorm lnF = layerNorm(weights, "ln_f", cfg.dModel, cfg.layerNormEps);
+        LayerNorm lnF = layerNorm(weights, "ln_f", cfg.dModel(), cfg.layerNormEps());
         return new TransformerModel(cfg, wteE, wpeE, blocks, lnF);
     }
 
@@ -68,31 +69,31 @@ public final class ModelLoader {
         Random rnd = new Random(42L);
         float baseStd = 0.02f;                       // GPT-2/GPT-3 标准初始化标准差
         float resStd = cfg.residualInitStd(baseStd); // 残差投影 modified init：0.02/sqrt(2*nLayer)
-        Embedding wteE = new Embedding(randN(rnd, cfg.vocabSize * cfg.dModel, 0.02f),
-                cfg.vocabSize, cfg.dModel);
-        Embedding wpeE = new Embedding(randN(rnd, cfg.maxSeqLen * cfg.dModel, 0.02f),
-                cfg.maxSeqLen, cfg.dModel);
+        Embedding wteE = new Embedding(ArrayUtil.randNormal(rnd, cfg.vocabSize() * cfg.dModel(), 0.02f),
+                cfg.vocabSize(), cfg.dModel());
+        Embedding wpeE = new Embedding(ArrayUtil.randNormal(rnd, cfg.maxSeqLen() * cfg.dModel(), 0.02f),
+                cfg.maxSeqLen(), cfg.dModel());
 
-        TransformerBlock[] blocks = new TransformerBlock[cfg.nLayer];
-        for (int i = 0; i < cfg.nLayer; i++) {
-            LayerNorm ln1 = layerNormRand(rnd, cfg.dModel, cfg.layerNormEps);
-            LayerNorm ln2 = layerNormRand(rnd, cfg.dModel, cfg.layerNormEps);
-            Linear q = linearRand(rnd, cfg.dModel, cfg.dModel, baseStd);
-            Linear k = linearRand(rnd, cfg.dModel, cfg.dModel, baseStd);
-            Linear v = linearRand(rnd, cfg.dModel, cfg.dModel, baseStd);
-            Linear o = linearRand(rnd, cfg.dModel, cfg.dModel, resStd); // 残差路径投影（modified init）
+        TransformerBlock[] blocks = new TransformerBlock[cfg.nLayer()];
+        for (int i = 0; i < cfg.nLayer(); i++) {
+            LayerNorm ln1 = layerNormRand(rnd, cfg.dModel(), cfg.layerNormEps());
+            LayerNorm ln2 = layerNormRand(rnd, cfg.dModel(), cfg.layerNormEps());
+            Linear q = linearRand(rnd, cfg.dModel(), cfg.dModel(), baseStd);
+            Linear k = linearRand(rnd, cfg.dModel(), cfg.dModel(), baseStd);
+            Linear v = linearRand(rnd, cfg.dModel(), cfg.dModel(), baseStd);
+            Linear o = linearRand(rnd, cfg.dModel(), cfg.dModel(), resStd); // 残差路径投影（modified init）
             // GPT-3 交替：奇数层用局部带状稀疏注意力，偶数层 dense
-            Attention attn = new Attention(cfg, q, k, v, o, cfg.isSparseLayer(i), cfg.sparseWindow);
-            Linear fc1 = linearRand(rnd, cfg.dModel, cfg.dFfn, baseStd);
-            Linear fc2 = linearRand(rnd, cfg.dFfn, cfg.dModel, resStd);  // 残差路径投影（modified init）
+            Attention attn = new Attention(cfg, q, k, v, o, cfg.isSparseLayer(i), cfg.sparseWindow());
+            Linear fc1 = linearRand(rnd, cfg.dModel(), cfg.dFfn(), baseStd);
+            Linear fc2 = linearRand(rnd, cfg.dFfn(), cfg.dModel(), resStd);  // 残差路径投影（modified init）
             Ffn ffn = new Ffn(fc1, fc2);
-            blocks[i] = new TransformerBlock(ln1, ln2, attn, ffn, cfg.dModel);
+            blocks[i] = new TransformerBlock(ln1, ln2, attn, ffn, cfg.dModel());
         }
-        LayerNorm lnF = layerNormRand(rnd, cfg.dModel, cfg.layerNormEps);
+        LayerNorm lnF = layerNormRand(rnd, cfg.dModel(), cfg.layerNormEps());
         return new TransformerModel(cfg, wteE, wpeE, blocks, lnF);
     }
 
-    // ---------- 辅助构造 ----------
+    // ─── 辅助构造 ───
 
     private static float[] get(Map<String, float[]> w, String name, int expect) {
         float[] d = w.get(name);
@@ -129,22 +130,7 @@ public final class ModelLoader {
     }
 
     private static Linear linearRand(Random rnd, int in, int out, float std) {
-        float[] weight = randN(rnd, out * in, std);
+        float[] weight = ArrayUtil.randNormal(rnd, out * in, std);
         return new Linear(weight, new float[out], in, out); // bias 初始化为 0
-    }
-
-    /** Box-Muller 生成正态分布随机数 */
-    private static float[] randN(Random rnd, int n, float std) {
-        float[] r = new float[n];
-        for (int i = 0; i < n; i += 2) {
-            double u1 = Math.max(rnd.nextDouble(), 1e-12);
-            double u2 = rnd.nextDouble();
-            double radius = Math.sqrt(-2.0 * Math.log(u1));
-            r[i] = (float) (radius * Math.cos(2 * Math.PI * u2) * std);
-            if (i + 1 < n) {
-                r[i + 1] = (float) (radius * Math.sin(2 * Math.PI * u2) * std);
-            }
-        }
-        return r;
     }
 }

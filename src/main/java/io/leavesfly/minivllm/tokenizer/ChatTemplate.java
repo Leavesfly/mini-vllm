@@ -28,15 +28,8 @@ public final class ChatTemplate {
     private ChatTemplate() {
     }
 
-    /** 一条对话消息 */
-    public static final class Message {
-        public final String role;
-        public final String content;
-
-        public Message(String role, String content) {
-            this.role = role;
-            this.content = content;
-        }
+    /** 一条对话消息（不可变值对象） */
+    public record Message(String role, String content) {
     }
 
     /**
@@ -53,10 +46,10 @@ public final class ChatTemplate {
      *                       false 时预填空 think 块，直接作答（响应更快、更简短）。
      */
     public static String applyChatML(List<Message> messages, boolean enableThinking) {
-        StringBuilder sb = new StringBuilder();
-        for (Message m : messages) {
-            sb.append(IM_START).append(m.role).append('\n')
-                    .append(m.content).append(IM_END).append('\n');
+        var sb = new StringBuilder();
+        for (var m : messages) {
+            sb.append(IM_START).append(m.role()).append('\n')
+                    .append(m.content()).append(IM_END).append('\n');
         }
         sb.append(IM_START).append("assistant\n");
         if (!enableThinking) {

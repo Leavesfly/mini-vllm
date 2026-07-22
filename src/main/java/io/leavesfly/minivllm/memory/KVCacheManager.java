@@ -2,6 +2,7 @@ package io.leavesfly.minivllm.memory;
 
 import java.util.HashMap;
 import java.util.Map;
+import java.util.Objects;
 
 /**
  * KVCacheManager —— PagedAttention 内存管理总指挥。
@@ -12,22 +13,42 @@ import java.util.Map;
  * 3. 释放：请求结束时按引用计数释放所有 block（共享 block 不会立即回收）。
  * 4. 前缀共享（PrefixCache）：多个请求若含相同 token 前缀，复用已缓存的 block，省算省存。
  *
- * 学习要点：这里没有一次性预留整段显存，而是"用到才给一块"，因此既无内部碎片
+ * 学习要点：这里没有一次性预留整段显存，而是“用到才给一块”，因此既无内部碎片
  * （block 等大，任意空闲块都能用），也几乎无外部碎片。这正是 vLLM 高吞吐的根基。
  */
 public final class KVCacheManager {
 
-    public final BlockPool pool;
-    public final int blockSize;
-    public final int dModel;
+    private final BlockPool pool;
+    private final int blockSize;
+    private final int dModel;
 
     /** 前缀缓存：block 内容指纹 -> 物理块 id，用于跨请求共享相同前缀 */
     private final PrefixCache prefixCache = new PrefixCache();
 
     public KVCacheManager(int numBlocks, int blockSize, int dModel) {
+        if (numBlocks <= 0) throw new IllegalArgumentException("numBlocks 必须 > 0");
+        if (blockSize <= 0) throw new IllegalArgumentException("blockSize 必须 > 0");
+        if (dModel <= 0) throw new IllegalArgumentException("dModel 必须 > 0");
         this.pool = new BlockPool(numBlocks, blockSize, dModel);
         this.blockSize = blockSize;
         this.dModel = dModel;
+    }
+
+    public BlockPool pool() {
+        return pool;
+    }
+
+    public int blockSize() {
+        return blockSize;
+    }
+
+    public int dModel() {
+        return dModel;
+    }
+
+    /** 剩余可用 block 数（便捷委托） */
+    public int freeBlocks() {
+        return pool.freeBlocks();
     }
 
     /**
@@ -93,7 +114,7 @@ public final class KVCacheManager {
         bt.clear();
     }
 
-    // ---------- 前缀共享 ----------
+    // ─── 前缀共享 ───
 
     /**
      * 尝试为新请求复用已缓存的前缀 block。
@@ -129,7 +150,7 @@ public final class KVCacheManager {
         }
     }
 
-    // ---------- 供 attention 层遍历的便捷接口 ----------
+    // ─── 供 attention 层遍历的便捷接口 ───
 
     /** 第 logicalBlockIdx 个逻辑 block 的 K 数组（行优先 [blockSize, dModel]） */
     public float[] blockK(BlockTable bt, int logicalBlockIdx) {
@@ -141,16 +162,19 @@ public final class KVCacheManager {
         return pool.get(bt.blockIdAt(logicalBlockIdx)).v;
     }
 
-    // ---------- 简化版前缀缓存 ----------
+    // ─── 简化版前缀缓存 ───
     // 真实 vLLM 用 RadixAttention 树做精确前缀匹配；这里用 block 级哈希映射，
     // 学习项目可接受极小概率哈希冲突（注释提醒：生产环境需校验内容）。
+
+    private static final long HASH_MULTIPLIER = 131L;
+
     private static final class PrefixCache {
         private final Map<Long, Integer> map = new HashMap<>();
 
         long fingerprint(int[] tokens, int start, int len) {
             long h = 0L;
             for (int i = 0; i < len; i++) {
-                h = h * 131L + tokens[start + i];
+                h = h * HASH_MULTIPLIER + tokens[start + i];
             }
             return h;
         }
