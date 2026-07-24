@@ -187,8 +187,9 @@ public final class BpeTokenizer implements SimpleTokenizer {
     }
 
     /** 创建流式增量解码器：逐 token 喂入，只返回可完整解码的文本片段 */
+    @Override
     public IncrementalDecoder incrementalDecoder() {
-        return new IncrementalDecoder(this);
+        return new BpeIncrementalDecoder(this);
     }
 
     // ─── 内部实现 ───
@@ -321,21 +322,22 @@ public final class BpeTokenizer implements SimpleTokenizer {
     }
 
     /**
-     * 流式增量解码器：把逐 token 的字节先缓冲，只输出可完整解码的 UTF-8 文本。
+     * 流式增量解码器的 BPE 实现：把逐 token 的字节先缓冲，只输出可完整解码的 UTF-8 文本。
      * 解决多字节字符（中文/emoji）被 token 边界切开时输出乱码（'�'）的问题。
      */
-    public static final class IncrementalDecoder {
+    private static final class BpeIncrementalDecoder implements IncrementalDecoder {
         private final BpeTokenizer tokenizer;
         private final ByteArrayOutputStream pending = new ByteArrayOutputStream(64);
         private final CharsetDecoder decoder = StandardCharsets.UTF_8.newDecoder()
                 .onMalformedInput(CodingErrorAction.REPLACE)
                 .onUnmappableCharacter(CodingErrorAction.REPLACE);
 
-        private IncrementalDecoder(BpeTokenizer tokenizer) {
+        private BpeIncrementalDecoder(BpeTokenizer tokenizer) {
             this.tokenizer = tokenizer;
         }
 
         /** 喂入一个 token，返回本次可输出的文本（可能为空串） */
+        @Override
         public synchronized String accept(int tokenId) {
             String t = tokenId >= 0 && tokenId < tokenizer.idToToken.length
                     ? tokenizer.idToToken[tokenId] : null;
@@ -372,6 +374,7 @@ public final class BpeTokenizer implements SimpleTokenizer {
         }
 
         /** 冲刷剩余字节（生成结束时调用） */
+        @Override
         public synchronized String flush() {
             byte[] all = pending.toByteArray();
             pending.reset();

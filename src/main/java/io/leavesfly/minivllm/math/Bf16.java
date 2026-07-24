@@ -1,4 +1,4 @@
-package io.leavesfly.minivllm.weights;
+package io.leavesfly.minivllm.math;
 
 /**
  * Bf16 —— BF16 / F16 半精度浮点到 F32 的转换。

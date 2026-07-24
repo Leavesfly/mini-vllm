@@ -3,6 +3,7 @@ package io.leavesfly.minivllm.api;
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpHandler;
 import io.leavesfly.minivllm.core.LLMEngine;
+import io.leavesfly.minivllm.core.SamplingParams;
 import io.leavesfly.minivllm.core.Sequence;
 import io.leavesfly.minivllm.json.SimpleJson;
 import io.leavesfly.minivllm.tokenizer.ChatTemplate;
@@ -29,6 +30,7 @@ import java.util.Map;
  * 3. 流式：每个 token 经 onToken 回调通过 SseWriter 推送一个 chunk，最后发 [DONE]。
  *    非流式：收集所有 token 后一次性返回完整 JSON。
  * 4. handler 线程阻塞等待 Sequence 完成（engine 线程异步推进 step），体现了请求与引擎的解耦。
+ * 5. 对话模板经构造器注入 ChatTemplate 接口：本类不感知具体模型的 prompt 格式。
  */
 public final class OpenAiHandler implements HttpHandler {
 
@@ -37,10 +39,12 @@ public final class OpenAiHandler implements HttpHandler {
 
     private final LLMEngine engine;
     private final String modelName;
+    private final ChatTemplate chatTemplate;
 
-    public OpenAiHandler(LLMEngine engine, String modelName) {
+    public OpenAiHandler(LLMEngine engine, String modelName, ChatTemplate chatTemplate) {
         this.engine = engine;
         this.modelName = modelName;
+        this.chatTemplate = chatTemplate;
     }
 
     @Override
@@ -73,26 +77,33 @@ public final class OpenAiHandler implements HttpHandler {
         boolean enableThinking = Boolean.TRUE.equals(req.get("enable_thinking"));
         String prompt = extractPrompt(req, enableThinking);
         boolean stream = Boolean.TRUE.equals(req.get("stream"));
-        int maxTokens = intOr(req.get("max_tokens"), 512);
-        float temperature = (float) doubleOr(req.get("temperature"), 0.8);
-        float topP = (float) doubleOr(req.get("top_p"), 0.9);
-        int topK = intOr(req.get("top_k"), 0);
+        SamplingParams params = parseSamplingParams(req);
 
         if (stream) {
-            handleStream(exchange, prompt, maxTokens, temperature, topK, topP);
+            handleStream(exchange, prompt, params);
         } else {
-            handleNonStream(exchange, prompt, maxTokens, temperature, topK, topP);
+            handleNonStream(exchange, prompt, params);
         }
     }
 
+    /** 未显式传参的字段回退到 {@link SamplingParams#DEFAULT}（与引擎共用同一份默认值） */
+    private static SamplingParams parseSamplingParams(Map<String, Object> req) {
+        SamplingParams def = SamplingParams.DEFAULT;
+        return new SamplingParams(
+                intOr(req.get("max_tokens"), def.maxTokens()),
+                (float) doubleOr(req.get("temperature"), def.temperature()),
+                intOr(req.get("top_k"), def.topK()),
+                (float) doubleOr(req.get("top_p"), def.topP()));
+    }
+
     /** 流式：边生成边推送 SSE chunk */
-    private void handleStream(HttpExchange exchange, String prompt, int maxTokens,
-                              float temperature, int topK, float topP) throws IOException {
+    private void handleStream(HttpExchange exchange, String prompt, SamplingParams params)
+            throws IOException {
         SseWriter sse = new SseWriter(exchange);
         String id = "chatcmpl-" + System.currentTimeMillis();
         long created = System.currentTimeMillis() / 1000;
         try {
-            Sequence seq = engine.addRequest(prompt, maxTokens, temperature, topK, topP, token -> {
+            Sequence seq = engine.addRequest(prompt, params, token -> {
                 try {
                     sse.write(streamChunk(id, created, token, null));
                 } catch (IOException ignored) {
@@ -112,10 +123,10 @@ public final class OpenAiHandler implements HttpHandler {
     }
 
     /** 非流式：等全部生成后返回完整 JSON */
-    private void handleNonStream(HttpExchange exchange, String prompt, int maxTokens,
-                                 float temperature, int topK, float topP) throws IOException {
+    private void handleNonStream(HttpExchange exchange, String prompt, SamplingParams params)
+            throws IOException {
         List<String> collected = Collections.synchronizedList(new ArrayList<>());
-        Sequence seq = engine.addRequest(prompt, maxTokens, temperature, topK, topP, collected::add);
+        Sequence seq = engine.addRequest(prompt, params, collected::add);
         try {
             seq.awaitDone();
         } catch (InterruptedException e) {
@@ -186,14 +197,14 @@ public final class OpenAiHandler implements HttpHandler {
 
     /**
      * 从 messages 数组构造 prompt：
-     * - chatML 模式（Qwen3 等对话模型）：渲染为 ChatML 格式（<|im_start|>...<|im_end|>）
-     * - 纯文本模式（prompt 字段 / 学习用微模型）：原样返回
+     * - messages 模式：由注入的 ChatTemplate 渲染（Qwen3 为 ChatML，微模型为纯文本）
+     * - 纯文本模式（prompt 字段）：原样返回
      */
     @SuppressWarnings("unchecked")
     private String extractPrompt(Map<String, Object> req, boolean enableThinking) {
         Object msgs = req.get("messages");
         if (msgs == null) {
-            // 纯文本 prompt（学习用微模型）：不套 ChatML，原样返回
+            // 纯文本 prompt（学习用微模型）：不套对话模板，原样返回
             Object p = req.get("prompt");
             return p == null ? "" : p.toString();
         }
@@ -204,7 +215,7 @@ public final class OpenAiHandler implements HttpHandler {
             String content = String.valueOf(m.getOrDefault("content", ""));
             list.add(new ChatTemplate.Message(role, content));
         }
-        return ChatTemplate.applyChatML(list, enableThinking);
+        return chatTemplate.render(list, enableThinking);
     }
 
     private String readBody(HttpExchange exchange) throws IOException {

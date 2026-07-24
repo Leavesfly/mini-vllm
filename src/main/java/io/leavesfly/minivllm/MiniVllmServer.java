@@ -2,23 +2,23 @@ package io.leavesfly.minivllm;
 
 import com.sun.net.httpserver.HttpServer;
 import io.leavesfly.minivllm.core.LLMEngine;
-import io.leavesfly.minivllm.json.SimpleJson;
+import io.leavesfly.minivllm.family.LoadedModel;
+import io.leavesfly.minivllm.family.ModelRegistry;
+import io.leavesfly.minivllm.family.Precision;
 import io.leavesfly.minivllm.memory.KVCacheManager;
-import io.leavesfly.minivllm.model.LlmModel;
 import io.leavesfly.minivllm.model.ModelConfig;
 import io.leavesfly.minivllm.model.TransformerModel;
 import io.leavesfly.minivllm.tokenizer.BpeTokenizer;
 import io.leavesfly.minivllm.tokenizer.ByteTokenizer;
+import io.leavesfly.minivllm.tokenizer.PlainTextTemplate;
 import io.leavesfly.minivllm.tokenizer.SimpleTokenizer;
 import io.leavesfly.minivllm.weights.ModelDownloader;
 import io.leavesfly.minivllm.weights.ModelLoader;
-import io.leavesfly.minivllm.weights.Qwen3Loader;
 import io.leavesfly.minivllm.weights.SafetensorsLoader;
 import io.leavesfly.minivllm.api.OpenAiHandler;
 import io.leavesfly.minivllm.api.WebUiHandler;
 
 import java.net.InetSocketAddress;
-import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Map;
 import java.util.concurrent.Executors;
@@ -28,7 +28,8 @@ import java.util.concurrent.Executors;
  *
  * 启动流程：
  *   1. 解析参数（端口 / 权重路径 / 随机初始化 / 并发数 / block 数）
- *   2. 加载模型（safetensors 权重 或 随机初始化兜底）
+ *   2. 加载模型（--model-dir 经 ModelRegistry 按 model_type 分发到 ModelFamily；
+ *      遗留学习路径 --random/--gpt3/--weights 直接构造微模型）
  *   3. 构建 KVCacheManager（PagedAttention 内存池）
  *   4. 构建 LLMEngine 并 start()（独立线程跑 continuous batching）
  *   5. 启动 JDK HttpServer，注册 OpenAI 兼容 API
@@ -56,9 +57,6 @@ public final class MiniVllmServer {
     private static final long DEFAULT_SEED = 12345L;
     private static final int DEFAULT_MAX_SEQ_LEN = 2048;
     private static final String DEFAULT_MODEL_REPO = "Qwen/Qwen3-0.6B";
-    private static final int QWEN3_EOS_IM_END = 151645;
-    private static final int QWEN3_EOS_ENDOFTEXT = 151643;
-    private static final int DEFAULT_QWEN3_MAX_SEQS = 2;
     private static final int DEFAULT_LEARNING_MAX_SEQS = 8;
     private static final int MIN_NUM_BLOCKS = 1024;
 
@@ -81,12 +79,6 @@ public final class MiniVllmServer {
         String mirror = System.getenv("MINIVLLM_MIRROR");
     }
 
-    /** 模型加载结果 */
-    private record LoadedModel(ModelConfig config, LlmModel model, SimpleTokenizer tokenizer,
-                               int[] eosTokens, int kvDim) {
-    }
-
-
     public static void main(String[] args) throws Exception {
         ServerConfig config = parseArgs(args);
         printRuntimeDiagnostics();
@@ -96,11 +88,15 @@ public final class MiniVllmServer {
             config.modelDir = new ModelDownloader(config.modelRepo, config.mirror).resolve().toString();
         }
 
+        // HF 风格模型目录统一走 ModelRegistry（ServiceLoader 插件分发），
+        // 遗留学习路径（随机微模型 / GPT-3 预设）保留直接构造
         LoadedModel loaded = config.modelDir != null
-                ? loadQwen3Model(config)
+                ? new ModelRegistry().load(Path.of(config.modelDir),
+                        config.bf16 ? Precision.BF16 : Precision.F32,
+                        config.random, config.maxSeqLen)
                 : loadLegacyModel(config);
 
-        int maxNumSeqs = resolveMaxNumSeqs(config, loaded.config());
+        int maxNumSeqs = resolveMaxNumSeqs(config, loaded);
         KVCacheManager kvMgr = buildKvPool(loaded.config(), loaded.kvDim(),
                 maxNumSeqs, config.numBlocks);
         LLMEngine engine = new LLMEngine(loaded.model(), kvMgr, loaded.tokenizer(),
@@ -108,7 +104,7 @@ public final class MiniVllmServer {
         engine.setVerbose(config.verbose);
         engine.start();
 
-        startHttpServer(engine, config.port, maxNumSeqs);
+        startHttpServer(engine, loaded, config.port, maxNumSeqs);
         printBanner(config.port, loaded, maxNumSeqs, config.numBlocks);
     }
 
@@ -138,51 +134,13 @@ public final class MiniVllmServer {
         return config;
     }
 
-    private static int resolveMaxNumSeqs(ServerConfig config, ModelConfig cfg) {
-        if (config.maxNumSeqs > 0) {
-            return config.maxNumSeqs;
-        }
-        return "qwen3".equals(cfg.arch()) ? DEFAULT_QWEN3_MAX_SEQS : DEFAULT_LEARNING_MAX_SEQS;
+    /** 优先命令行 --max-seqs，否则用模型家族给出的建议并发数 */
+    private static int resolveMaxNumSeqs(ServerConfig config, LoadedModel loaded) {
+        return config.maxNumSeqs > 0 ? config.maxNumSeqs : loaded.defaultMaxSeqs();
     }
 
 
-    // ─── 模型加载 ───
-
-    private static LoadedModel loadQwen3Model(ServerConfig config) throws Exception {
-        Path dir = Path.of(config.modelDir);
-        ModelConfig cfg = ModelConfig.fromConfigJson(SimpleJson.parseObject(
-                Files.readString(dir.resolve("config.json"))));
-        cfg.maxSeqLen(Math.min(cfg.maxSeqLen(), config.maxSeqLen));
-
-        LlmModel model;
-        if (config.random) {
-            model = Qwen3Loader.randomInit(cfg);
-            System.out.println("使用随机初始化 Qwen3 模型（输出无意义，仅验证流程）");
-        } else {
-            System.out.println("加载权重: " + dir.resolve("model.safetensors")
-                    + (config.bf16 ? " (bf16 常驻)" : " (f32 常驻)"));
-            long t0 = System.currentTimeMillis();
-            if (config.bf16) {
-                Map<String, short[]> weights = SafetensorsLoader.loadBf16Bits(dir.resolve("model.safetensors"));
-                System.out.printf("权重读取完成: %d 个张量, %.1f s%n",
-                        weights.size(), (System.currentTimeMillis() - t0) / 1000.0);
-                model = Qwen3Loader.loadBf16(cfg, weights);
-            } else {
-                Map<String, float[]> weights = SafetensorsLoader.load(dir.resolve("model.safetensors"));
-                System.out.printf("权重读取完成: %d 个张量, %.1f s%n",
-                        weights.size(), (System.currentTimeMillis() - t0) / 1000.0);
-                model = Qwen3Loader.load(cfg, weights);
-            }
-        }
-
-        SimpleTokenizer tokenizer = BpeTokenizer.fromModelDir(dir);
-        int[] eosTokens = cfg.eosTokenIds().length > 0
-                ? cfg.eosTokenIds()
-                : new int[]{QWEN3_EOS_IM_END, QWEN3_EOS_ENDOFTEXT};
-        System.out.println("Qwen3 模型就绪: " + cfg.nLayer() + " 层, 参数量 "
-                + model.numParameters() + ", vocab=" + tokenizer.vocabSize());
-        return new LoadedModel(cfg, model, tokenizer, eosTokens, cfg.kvDim());
-    }
+    // ─── 遗留学习路径（随机微模型 / GPT-3 预设，非 HF 模型目录） ───
 
     private static LoadedModel loadLegacyModel(ServerConfig config) throws Exception {
         ModelConfig cfg = config.gpt3 ? ModelConfig.gpt3Nano() : ModelConfig.small();
@@ -201,7 +159,8 @@ public final class MiniVllmServer {
         SimpleTokenizer tokenizer = config.tokenizerDir != null
                 ? BpeTokenizer.fromModelDir(Path.of(config.tokenizerDir))
                 : new ByteTokenizer();
-        return new LoadedModel(cfg, gptModel, tokenizer, new int[0], cfg.dModel());
+        return new LoadedModel(cfg, gptModel, tokenizer, new PlainTextTemplate(),
+                new int[0], cfg.dModel(), DEFAULT_LEARNING_MAX_SEQS);
     }
 
 
@@ -222,9 +181,10 @@ public final class MiniVllmServer {
 
     // ─── HTTP 服务 ───
 
-    private static void startHttpServer(LLMEngine engine, int port, int maxNumSeqs) throws Exception {
+    private static void startHttpServer(LLMEngine engine, LoadedModel loaded, int port,
+                                        int maxNumSeqs) throws Exception {
         HttpServer server = HttpServer.create(new InetSocketAddress(port), 0);
-        server.createContext("/v1", new OpenAiHandler(engine, "mini-vllm"));
+        server.createContext("/v1", new OpenAiHandler(engine, "mini-vllm", loaded.chatTemplate()));
         server.createContext("/", new WebUiHandler());
         server.setExecutor(Executors.newFixedThreadPool(Math.max(16, maxNumSeqs * 4)));
         server.start();

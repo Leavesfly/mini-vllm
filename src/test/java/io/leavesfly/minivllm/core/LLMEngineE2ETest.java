@@ -37,7 +37,13 @@ class LLMEngineE2ETest {
         TransformerModel model = ModelLoader.randomInit(cfg);
         KVCacheManager kvMgr = new KVCacheManager(512, cfg.blockSize(), cfg.dModel());
         ByteTokenizer tokenizer = new ByteTokenizer();
-        return new LLMEngine(model, kvMgr, tokenizer, maxNumSeqs, eosToken, seed);
+        int[] eosTokens = eosToken < 0 ? new int[0] : new int[]{eosToken};
+        return new LLMEngine(model, kvMgr, tokenizer, maxNumSeqs, eosTokens, seed);
+    }
+
+    /** greedy 解码参数：temperature=0（argmax），不启用 top-k/top-p */
+    private static SamplingParams greedy(int maxTokens) {
+        return new SamplingParams(maxTokens, 0f, 0, 1f);
     }
 
     /** 同步驱动 admit→decode→sweep，直到没有待办工作（带死循环保护） */
@@ -63,7 +69,7 @@ class LLMEngineE2ETest {
         LLMEngine engine = newEngine(ModelConfig.small(), 4, -1, SEED);
         int maxTokens = 8;
 
-        Sequence seq = engine.addRequest("Hello", maxTokens, 0f, 0, 1f, null);
+        Sequence seq = engine.addRequest("Hello", greedy(maxTokens), null);
         driveToCompletion(engine);
 
         assertTrue(seq.isFinished());
@@ -76,7 +82,7 @@ class LLMEngineE2ETest {
     @Timeout(value = 30, unit = TimeUnit.SECONDS)
     void convenienceGenerateReturnsNonNullText() {
         LLMEngine engine = newEngine(ModelConfig.small(), 4, -1, SEED);
-        String out = engine.generate("The quick brown fox", 6, 0f, 0, 1f);
+        String out = engine.generate("The quick brown fox", greedy(6));
         assertNotNull(out);
         // greedy 下每步都会产出 token，文本不应异常抛错；长度非负即可
         assertTrue(out.length() >= 0);
@@ -89,9 +95,9 @@ class LLMEngineE2ETest {
         LLMEngine e1 = newEngine(ModelConfig.small(), 2, -1, SEED);
         LLMEngine e2 = newEngine(ModelConfig.small(), 2, -1, SEED + 999);
 
-        Sequence s1 = e1.addRequest("reproduce me", 10, 0f, 0, 1f, null);
+        Sequence s1 = e1.addRequest("reproduce me", greedy(10), null);
         driveToCompletion(e1);
-        Sequence s2 = e2.addRequest("reproduce me", 10, 0f, 0, 1f, null);
+        Sequence s2 = e2.addRequest("reproduce me", greedy(10), null);
         driveToCompletion(e2);
 
         assertEquals(copy(s1.outputTokens()), copy(s2.outputTokens()),
@@ -104,7 +110,7 @@ class LLMEngineE2ETest {
         int maxTokens = 6;
         // 探针：无 EOS 先跑一遍，记录 greedy 生成序列（确定性）
         LLMEngine probe = newEngine(ModelConfig.small(), 2, -1, SEED);
-        Sequence probeSeq = probe.addRequest("stop here", maxTokens, 0f, 0, 1f, null);
+        Sequence probeSeq = probe.addRequest("stop here", greedy(maxTokens), null);
         driveToCompletion(probe);
         assertEquals(maxTokens, probeSeq.outputTokens().size());
         // 取 decode 阶段会产生的一个 token 作为 EOS（第 2 个生成 token）
@@ -112,7 +118,7 @@ class LLMEngineE2ETest {
 
         // 设置该 token 为 EOS，并给足额度；greedy 确定性 → 生成到该 token 即停止
         LLMEngine engine = newEngine(ModelConfig.small(), 2, eos, SEED);
-        Sequence seq = engine.addRequest("stop here", 100, 0f, 0, 1f, null);
+        Sequence seq = engine.addRequest("stop here", greedy(100), null);
         driveToCompletion(engine);
 
         assertTrue(seq.isFinished());
@@ -130,7 +136,7 @@ class LLMEngineE2ETest {
         int maxTokens = 6;
         List<Sequence> seqs = new ArrayList<>();
         for (int i = 0; i < nReq; i++) {
-            seqs.add(engine.addRequest("request-" + i, maxTokens, 0f, 0, 1f, null));
+            seqs.add(engine.addRequest("request-" + i, greedy(maxTokens), null));
         }
 
         driveToCompletion(engine);
@@ -150,7 +156,7 @@ class LLMEngineE2ETest {
         List<String> streamed = new CopyOnWriteArrayList<>();
         int maxTokens = 7;
 
-        Sequence seq = engine.addRequest("stream", maxTokens, 0f, 0, 1f, streamed::add);
+        Sequence seq = engine.addRequest("stream", greedy(maxTokens), streamed::add);
         driveToCompletion(engine);
 
         // 每生成一个 token 触发一次回调：回调次数 == 生成 token 数
@@ -164,7 +170,7 @@ class LLMEngineE2ETest {
         ModelConfig cfg = ModelConfig.small();
         LLMEngine engine = newEngine(cfg, 2, -1, SEED);
         // 打开 temperature/top-k/top-p 采样路径
-        Sequence seq = engine.addRequest("sample path", 12, 0.8f, 40, 0.9f, null);
+        Sequence seq = engine.addRequest("sample path", new SamplingParams(12, 0.8f, 40, 0.9f), null);
         driveToCompletion(engine);
 
         assertFalse(seq.outputTokens().isEmpty());
@@ -182,7 +188,7 @@ class LLMEngineE2ETest {
         LLMEngine engine = newEngine(cfg, 2, -1, SEED);
         int maxTokens = 6;
 
-        Sequence seq = engine.addRequest("gpt3 nano end to end", maxTokens, 0f, 0, 1f, null);
+        Sequence seq = engine.addRequest("gpt3 nano end to end", greedy(maxTokens), null);
         driveToCompletion(engine);
 
         assertTrue(seq.isFinished());
@@ -200,7 +206,7 @@ class LLMEngineE2ETest {
         engine.start();
         try {
             List<String> streamed = new CopyOnWriteArrayList<>();
-            Sequence seq = engine.addRequest("async", 5, 0f, 0, 1f, streamed::add);
+            Sequence seq = engine.addRequest("async", greedy(5), streamed::add);
 
             long deadline = System.currentTimeMillis() + 20_000;
             while (!seq.isFinished() && System.currentTimeMillis() < deadline) {

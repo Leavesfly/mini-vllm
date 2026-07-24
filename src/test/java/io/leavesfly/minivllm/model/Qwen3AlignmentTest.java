@@ -5,6 +5,7 @@ import io.leavesfly.minivllm.memory.BlockTable;
 import io.leavesfly.minivllm.memory.KVCacheManager;
 import io.leavesfly.minivllm.tokenizer.BpeTokenizer;
 import io.leavesfly.minivllm.tokenizer.ChatTemplate;
+import io.leavesfly.minivllm.tokenizer.Qwen3ChatMLTemplate;
 import io.leavesfly.minivllm.weights.Qwen3Loader;
 import io.leavesfly.minivllm.weights.SafetensorsLoader;
 import org.junit.jupiter.api.BeforeAll;
@@ -86,7 +87,7 @@ class Qwen3AlignmentTest {
         List<ChatTemplate.Message> msgs = new ArrayList<>();
         msgs.add(new ChatTemplate.Message("user", user));
         // HF 参考用默认 enable_thinking=true 生成，这里显式开启以对齐
-        assertEquals(prompt, ChatTemplate.applyChatML(msgs, true), "ChatML 模板与 HF apply_chat_template 不一致");
+        assertEquals(prompt, new Qwen3ChatMLTemplate().render(msgs, true), "ChatML 模板与 HF apply_chat_template 不一致");
 
         // ---------- 2. 分词 ids 一致 ----------
         BpeTokenizer tok = BpeTokenizer.fromModelDir(modelDir);

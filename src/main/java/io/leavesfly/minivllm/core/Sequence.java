@@ -1,7 +1,7 @@
 package io.leavesfly.minivllm.core;
 
 import io.leavesfly.minivllm.memory.BlockTable;
-import io.leavesfly.minivllm.tokenizer.BpeTokenizer;
+import io.leavesfly.minivllm.tokenizer.IncrementalDecoder;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -14,7 +14,7 @@ import java.util.function.Consumer;
  * 学习要点（对照 vLLM SequenceGroup）：
  * 1. 每个请求持有一组 BlockTable（每层一个），因为每层注意力有独立的 KV cache。
  * 2. 生命周期：WAITING（排队）→ PREFILL（处理 prompt）→ DECODE（逐 token 生成）→ FINISHED。
- * 3. 生成参数(maxTokens/temperature/topK/topP)对应 OpenAI API 的同名参数。
+ * 3. 采样参数聚合在 {@link SamplingParams}，对应 OpenAI API 的同名参数。
  * 4. onToken 回调用于流式输出：每生成一个 token 就解码并推送文本片段给客户端。
  */
 public final class Sequence {
@@ -28,38 +28,24 @@ public final class Sequence {
     private final BlockTable[] blockTables;
     private volatile Stage stage = Stage.WAITING;
 
-    // 生成参数（对应 OpenAI API）
-    private final int maxTokens;
-    private final float temperature;
-    private final int topK;
-    private final float topP;
+    // 采样参数（对应 OpenAI API）
+    private final SamplingParams params;
     private final int[] eosTokens; // 空数组表示无 EOS
 
     /** 流式回调：每生成一个 token 解码后触发 */
     private final Consumer<String> onToken;
 
-    /** BPE 分词时的流式增量解码器（由引擎注入，处理跨 token UTF-8 边界） */
-    private volatile BpeTokenizer.IncrementalDecoder incDecoder;
+    /** 流式增量解码器（由引擎注入，处理跨 token UTF-8 边界） */
+    private volatile IncrementalDecoder incDecoder;
 
     /** 完成信号：请求结束时 countDown，等待方可用 awaitDone() 阻塞而非轮询 */
     private final CountDownLatch done = new CountDownLatch(1);
 
-    public Sequence(int id, int[] promptTokens, int maxTokens,
-                    float temperature, int topK, float topP, int eosToken,
-                    int nLayer, Consumer<String> onToken) {
-        this(id, promptTokens, maxTokens, temperature, topK, topP,
-                eosToken < 0 ? new int[0] : new int[]{eosToken}, nLayer, onToken);
-    }
-
-    public Sequence(int id, int[] promptTokens, int maxTokens,
-                    float temperature, int topK, float topP, int[] eosTokens,
+    public Sequence(int id, int[] promptTokens, SamplingParams params, int[] eosTokens,
                     int nLayer, Consumer<String> onToken) {
         this.id = id;
         this.promptTokens = promptTokens;
-        this.maxTokens = maxTokens;
-        this.temperature = temperature;
-        this.topK = topK;
-        this.topP = topP;
+        this.params = params;
         this.eosTokens = eosTokens;
         this.onToken = onToken;
         this.blockTables = new BlockTable[nLayer];
@@ -95,20 +81,8 @@ public final class Sequence {
         this.stage = stage;
     }
 
-    public int maxTokens() {
-        return maxTokens;
-    }
-
-    public float temperature() {
-        return temperature;
-    }
-
-    public int topK() {
-        return topK;
-    }
-
-    public float topP() {
-        return topP;
+    public SamplingParams params() {
+        return params;
     }
 
     public int[] eosTokens() {
@@ -119,11 +93,11 @@ public final class Sequence {
         return onToken;
     }
 
-    public BpeTokenizer.IncrementalDecoder incDecoder() {
+    public IncrementalDecoder incDecoder() {
         return incDecoder;
     }
 
-    public void setIncDecoder(BpeTokenizer.IncrementalDecoder incDecoder) {
+    public void setIncDecoder(IncrementalDecoder incDecoder) {
         this.incDecoder = incDecoder;
     }
 
@@ -132,7 +106,7 @@ public final class Sequence {
         if (stage == Stage.FINISHED || stage == Stage.ABORTED) {
             return true;
         }
-        if (outputTokens.size() >= maxTokens) {
+        if (outputTokens.size() >= params.maxTokens()) {
             return true;
         }
         if (!outputTokens.isEmpty()) {

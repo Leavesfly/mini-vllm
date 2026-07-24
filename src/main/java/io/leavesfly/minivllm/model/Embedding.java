@@ -1,7 +1,7 @@
 package io.leavesfly.minivllm.model;
 
+import io.leavesfly.minivllm.math.Bf16;
 import io.leavesfly.minivllm.math.Matmul;
-import io.leavesfly.minivllm.weights.Bf16;
 
 /**
  * 嵌入层 —— 把 token id 映射为稠密向量，是 TransformerModel 的输入入口。

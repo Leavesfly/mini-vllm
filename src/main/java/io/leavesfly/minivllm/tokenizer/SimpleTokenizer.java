@@ -20,4 +20,23 @@ public interface SimpleTokenizer {
 
     /** 词表大小 */
     int vocabSize();
+
+    /**
+     * 创建流式增量解码器。默认实现逐 token 直接解码（适用于字节/字符级等
+     * 无跨 token 截断问题的分词器）；BPE 等 byte-level 实现应覆盖为
+     * 缓冲式解码，避免多字节字符被 token 边界切开时输出乱码。
+     */
+    default IncrementalDecoder incrementalDecoder() {
+        return new IncrementalDecoder() {
+            @Override
+            public String accept(int tokenId) {
+                return decode(new int[]{tokenId});
+            }
+
+            @Override
+            public String flush() {
+                return "";
+            }
+        };
+    }
 }

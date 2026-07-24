@@ -5,6 +5,7 @@ import org.junit.jupiter.api.Test;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.function.Consumer;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -13,12 +14,21 @@ import static org.junit.jupiter.api.Assertions.*;
  */
 class CoreTest {
 
+    private static final int[] NO_EOS = new int[0];
+
+    /** 构造测试用 Sequence：temperature=1、不启用 top-k/top-p */
+    private static Sequence newSeq(int id, int[] prompt, int maxTokens, int[] eosTokens,
+                                   int nLayer, Consumer<String> onToken) {
+        return new Sequence(id, prompt, new SamplingParams(maxTokens, 1.0f, 0, 1.0f),
+                eosTokens, nLayer, onToken);
+    }
+
     // ========== Sequence 测试 ==========
 
     @Test
     void sequenceInitialState() {
         int[] prompt = {1, 2, 3};
-        Sequence seq = new Sequence(0, prompt, 10, 1.0f, 0, 1.0f, -1, 2, null);
+        Sequence seq = newSeq(0, prompt, 10, NO_EOS, 2, null);
         assertEquals(Sequence.Stage.WAITING, seq.stage());
         assertEquals(3, seq.promptTokens().length);
         assertTrue(seq.outputTokens().isEmpty());
@@ -28,7 +38,7 @@ class CoreTest {
     @Test
     void sequenceBlockTablesCreatedPerLayer() {
         int nLayer = 4;
-        Sequence seq = new Sequence(1, new int[]{1}, 10, 1.0f, 0, 1.0f, -1, nLayer, null);
+        Sequence seq = newSeq(1, new int[]{1}, 10, NO_EOS, nLayer, null);
         assertEquals(nLayer, seq.blockTables().length);
         for (BlockTable bt : seq.blockTables()) {
             assertNotNull(bt);
@@ -38,7 +48,7 @@ class CoreTest {
 
     @Test
     void sequenceIsFinishedByMaxTokens() {
-        Sequence seq = new Sequence(0, new int[]{1}, 3, 1.0f, 0, 1.0f, -1, 2, null);
+        Sequence seq = newSeq(0, new int[]{1}, 3, NO_EOS, 2, null);
         assertFalse(seq.isFinished());
         seq.outputTokens().add(10);
         seq.outputTokens().add(20);
@@ -50,7 +60,7 @@ class CoreTest {
     @Test
     void sequenceIsFinishedByEos() {
         int eos = 99;
-        Sequence seq = new Sequence(0, new int[]{1}, 100, 1.0f, 0, 1.0f, eos, 2, null);
+        Sequence seq = newSeq(0, new int[]{1}, 100, new int[]{eos}, 2, null);
         seq.outputTokens().add(10);
         assertFalse(seq.isFinished());
         seq.outputTokens().add(eos);
@@ -59,21 +69,21 @@ class CoreTest {
 
     @Test
     void sequenceIsFinishedByStage() {
-        Sequence seq = new Sequence(0, new int[]{1}, 100, 1.0f, 0, 1.0f, -1, 2, null);
+        Sequence seq = newSeq(0, new int[]{1}, 100, NO_EOS, 2, null);
         seq.setStage(Sequence.Stage.FINISHED);
         assertTrue(seq.isFinished());
     }
 
     @Test
     void sequenceIsFinishedByAborted() {
-        Sequence seq = new Sequence(0, new int[]{1}, 100, 1.0f, 0, 1.0f, -1, 2, null);
+        Sequence seq = newSeq(0, new int[]{1}, 100, NO_EOS, 2, null);
         seq.setStage(Sequence.Stage.ABORTED);
         assertTrue(seq.isFinished());
     }
 
     @Test
     void sequenceTotalLen() {
-        Sequence seq = new Sequence(0, new int[]{1, 2, 3}, 10, 1.0f, 0, 1.0f, -1, 2, null);
+        Sequence seq = newSeq(0, new int[]{1, 2, 3}, 10, NO_EOS, 2, null);
         assertEquals(3, seq.totalLen());
         seq.outputTokens().add(4);
         seq.outputTokens().add(5);
@@ -83,7 +93,7 @@ class CoreTest {
     @Test
     void sequenceOnTokenCallback() {
         List<String> received = new ArrayList<>();
-        Sequence seq = new Sequence(0, new int[]{1}, 10, 1.0f, 0, 1.0f, -1, 2, received::add);
+        Sequence seq = newSeq(0, new int[]{1}, 10, NO_EOS, 2, received::add);
         seq.onToken().accept("hello");
         seq.onToken().accept("world");
         assertEquals(List.of("hello", "world"), received);
@@ -94,7 +104,7 @@ class CoreTest {
     @Test
     void schedulerAddToWaiting() {
         Scheduler scheduler = new Scheduler(8);
-        Sequence seq = new Sequence(0, new int[]{1}, 10, 1.0f, 0, 1.0f, -1, 2, null);
+        Sequence seq = newSeq(0, new int[]{1}, 10, NO_EOS, 2, null);
         scheduler.add(seq);
         assertEquals(1, scheduler.waitingCount());
         assertTrue(scheduler.hasWork());
@@ -110,7 +120,7 @@ class CoreTest {
     void schedulerRunningList() {
         Scheduler scheduler = new Scheduler(4);
         assertEquals(0, scheduler.runningCount());
-        Sequence seq = new Sequence(0, new int[]{1}, 10, 1.0f, 0, 1.0f, -1, 2, null);
+        Sequence seq = newSeq(0, new int[]{1}, 10, NO_EOS, 2, null);
         scheduler.addRunning(seq);
         assertTrue(scheduler.hasWork());
         assertEquals(1, scheduler.runningCount());
@@ -131,8 +141,7 @@ class CoreTest {
             final int tid = t;
             threads[t] = new Thread(() -> {
                 for (int i = 0; i < 10; i++) {
-                    scheduler.add(new Sequence(tid * 10 + i, new int[]{1}, 10,
-                            1.0f, 0, 1.0f, -1, 2, null));
+                    scheduler.add(newSeq(tid * 10 + i, new int[]{1}, 10, NO_EOS, 2, null));
                 }
             });
         }

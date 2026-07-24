@@ -4,10 +4,7 @@ import io.leavesfly.minivllm.memory.BlockTable;
 import io.leavesfly.minivllm.memory.KVCacheManager;
 import io.leavesfly.minivllm.model.LlmModel;
 import io.leavesfly.minivllm.model.ModelConfig;
-import io.leavesfly.minivllm.model.TransformerModel;
-import io.leavesfly.minivllm.tokenizer.BpeTokenizer;
 import io.leavesfly.minivllm.tokenizer.SimpleTokenizer;
-import io.leavesfly.minivllm.math.Sampler;
 
 import java.util.ArrayList;
 import java.util.Collections;
@@ -26,22 +23,23 @@ import java.util.function.Consumer;
  * 3. sweepFinished：完成的请求释放 KV cache（按引用计数），移出 running——腾出的显存立刻供 waiting 请求使用。
  * 这三步循环正是 continuous batching 的本质：请求随时进出，GPU（这里用 CPU 模拟）始终尽量满载。
  *
+ * 可替换策略（扩展点，均经构造器注入）：
+ *   - {@link SchedulingPolicy}：admit 顺序（默认 FIFO）
+ *   - {@link SamplingStrategy}：logits → token（默认 temperature/top-k/top-p）
+ *   - {@link StopCriteria}：停止判断（默认 EOS + maxTokens）
+ *
  * 两种驱动模式：
  *   - start()：独立线程持续 step（服务模式，配合 HTTP API）。
  *   - generate()：同步驱动 step 直到单请求完成（测试 / 单请求）。
  */
 public final class LLMEngine {
 
-    // ─── 默认采样参数 ───
-
-    private static final float DEFAULT_TEMPERATURE = 0.8f;
-    private static final int DEFAULT_TOP_K = 0;
-    private static final float DEFAULT_TOP_P = 0.9f;
-
     private final LlmModel model;
     private final KVCacheManager kvMgr;
     private final SimpleTokenizer tokenizer;
-    private final Sampler sampler;
+    private final SamplingStrategy sampling;
+    private final StopCriteria stopCriteria;
+    private final SchedulingPolicy schedulingPolicy;
     private final Scheduler scheduler;
     private final ModelConfig cfg;
     private final int nLayer;
@@ -51,21 +49,26 @@ public final class LLMEngine {
     private final AtomicBoolean running = new AtomicBoolean(false);
     private volatile boolean verbose = false;
 
-    public LLMEngine(TransformerModel model, KVCacheManager kvMgr, SimpleTokenizer tokenizer,
-                     int maxNumSeqs, int eosToken, long seed) {
-        this((LlmModel) model, kvMgr, tokenizer, maxNumSeqs,
-                eosToken < 0 ? new int[0] : new int[]{eosToken}, seed);
-    }
-
+    /** 默认策略组合：FIFO 调度 + temperature/top-k/top-p 采样 + EOS/maxTokens 停止 */
     public LLMEngine(LlmModel model, KVCacheManager kvMgr, SimpleTokenizer tokenizer,
                      int maxNumSeqs, int[] eosTokens, long seed) {
+        this(model, kvMgr, tokenizer, maxNumSeqs, eosTokens,
+                new DefaultSamplingStrategy(seed), new EosMaxTokensCriteria(), new FifoPolicy());
+    }
+
+    /** 完整构造：自定义采样 / 停止 / 调度策略 */
+    public LLMEngine(LlmModel model, KVCacheManager kvMgr, SimpleTokenizer tokenizer,
+                     int maxNumSeqs, int[] eosTokens, SamplingStrategy sampling,
+                     StopCriteria stopCriteria, SchedulingPolicy schedulingPolicy) {
         this.model = model;
         this.kvMgr = kvMgr;
         this.tokenizer = tokenizer;
         this.cfg = model.config();
         this.nLayer = cfg.nLayer();
         this.eosTokens = eosTokens;
-        this.sampler = new Sampler(seed);
+        this.sampling = sampling;
+        this.stopCriteria = stopCriteria;
+        this.schedulingPolicy = schedulingPolicy;
         this.scheduler = new Scheduler(maxNumSeqs);
     }
 
@@ -82,16 +85,13 @@ public final class LLMEngine {
     }
 
     /** 加入一个异步请求，返回 Sequence 供调用方跟踪状态/流式回调 */
-    public Sequence addRequest(String prompt, int maxTokens,
-                               float temperature, int topK, float topP,
-                               Consumer<String> onToken) {
+    public Sequence addRequest(String prompt, SamplingParams params, Consumer<String> onToken) {
         int[] promptTokens = tokenizer.encode(prompt);
-        Sequence seq = new Sequence(nextId.getAndIncrement(), promptTokens, maxTokens,
-                temperature, topK, topP, eosTokens, nLayer, onToken);
-        // BPE 分词时注入增量解码器，避免跨 token 的 UTF-8 截断乱码
-        if (tokenizer instanceof BpeTokenizer) {
-            seq.setIncDecoder(((BpeTokenizer) tokenizer).incrementalDecoder());
-        }
+        Sequence seq = new Sequence(nextId.getAndIncrement(), promptTokens, params,
+                eosTokens, nLayer, onToken);
+        // 注入增量解码器：BPE 实现缓冲跨 token 的 UTF-8 字节避免乱码，
+        // 其余实现逐 token 直接解码（由分词器接口的默认方法提供）
+        seq.setIncDecoder(tokenizer.incrementalDecoder());
         scheduler.add(seq);
         return seq;
     }
@@ -112,7 +112,7 @@ public final class LLMEngine {
     /** 接纳新请求：prefill 并加入 running */
     private void admitNew() {
         while (scheduler.runningCount() < scheduler.maxNumSeqs()) {
-            Sequence seq = scheduler.peekWaiting();
+            Sequence seq = schedulingPolicy.nextToAdmit(scheduler);
             if (seq == null) break;
             int promptLen = seq.promptTokens().length;
             // 为每层分配 KV cache block
@@ -130,12 +130,11 @@ public final class LLMEngine {
                 }
                 break;
             }
-            scheduler.pollWaiting(); // 正式取出
+            scheduler.removeWaiting(seq); // 分配成功，正式从 waiting 移除
             seq.setStage(Sequence.Stage.PREFILL);
             // prefill：一次性处理整段 prompt，写入 KV cache，生成第一个 token
             float[] logits = model.prefillLogits(seq.promptTokens(), kvMgr, seq.blockTables(), 0);
-            configureSampler(seq);
-            int nextToken = sampler.sample(logits);
+            int nextToken = sampling.sample(logits, seq.params());
             seq.outputTokens().add(nextToken);
             seq.setStage(Sequence.Stage.DECODE);
             scheduler.addRunning(seq);
@@ -183,8 +182,7 @@ public final class LLMEngine {
         // 4. 逐序列采样并输出
         for (int i = 0; i < b; i++) {
             Sequence seq = batch.get(i);
-            configureSampler(seq);
-            int nextToken = sampler.sample(logits[i]);
+            int nextToken = sampling.sample(logits[i], seq.params());
             seq.outputTokens().add(nextToken);
             emitToken(seq, nextToken);
         }
@@ -193,7 +191,7 @@ public final class LLMEngine {
     /** 清扫完成/中止的请求，释放 KV cache */
     private void sweepFinished() {
         scheduler.removeRunningIf(seq -> {
-            if (seq.isFinished()) {
+            if (stopCriteria.shouldStop(seq)) {
                 // 冲刷增量解码器中剩余的字节（不完整的 UTF-8 尾部）
                 if (seq.incDecoder() != null && seq.onToken() != null) {
                     String rest = seq.incDecoder().flush();
@@ -212,20 +210,14 @@ public final class LLMEngine {
         });
     }
 
-    private void configureSampler(Sequence seq) {
-        sampler.configure(seq.temperature(), seq.topK(), seq.topP());
-    }
-
     private void emitToken(Sequence seq, int token) {
         if (seq.onToken() == null) {
             return;
         }
-        // EOS / 停止 token 不输出文本（否则 <|im_end|> 等会泄露到响应里，
+        // 停止 token 不输出文本（否则 <|im_end|> 等会泄露到响应里，
         // 并在多轮对话中污染 ChatML 上下文）
-        for (int eos : seq.eosTokens()) {
-            if (token == eos) {
-                return;
-            }
+        if (stopCriteria.isStopToken(seq, token)) {
+            return;
         }
         if (seq.incDecoder() != null) {
             String piece = seq.incDecoder().accept(token);
@@ -267,10 +259,9 @@ public final class LLMEngine {
      * 同步生成：加入请求后自己驱动 step 直到完成，返回完整文本。
      * 适合测试与单请求调用；多请求并发请用 start() + addRequest()。
      */
-    public String generate(String prompt, int maxTokens,
-                           float temperature, int topK, float topP) {
+    public String generate(String prompt, SamplingParams params) {
         List<String> collected = Collections.synchronizedList(new ArrayList<>());
-        Sequence seq = addRequest(prompt, maxTokens, temperature, topK, topP, collected::add);
+        Sequence seq = addRequest(prompt, params, collected::add);
         while (!seq.isFinished()) {
             if (scheduler.hasWork()) {
                 step();
@@ -281,6 +272,6 @@ public final class LLMEngine {
 
     /** 默认参数同步生成 */
     public String generate(String prompt, int maxTokens) {
-        return generate(prompt, maxTokens, DEFAULT_TEMPERATURE, DEFAULT_TOP_K, DEFAULT_TOP_P);
+        return generate(prompt, SamplingParams.DEFAULT.withMaxTokens(maxTokens));
     }
 }

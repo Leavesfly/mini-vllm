@@ -41,6 +41,11 @@ public final class Scheduler {
         return waiting.poll();
     }
 
+    /** 从 waiting 中移除指定请求（SchedulingPolicy 选中并分配成功后调用） */
+    public boolean removeWaiting(Sequence seq) {
+        return waiting.remove(seq);
+    }
+
     /** 将请求加入 running 列表 */
     public void addRunning(Sequence seq) {
         running.add(seq);

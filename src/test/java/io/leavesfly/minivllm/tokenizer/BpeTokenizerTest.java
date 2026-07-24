@@ -122,7 +122,7 @@ class BpeTokenizerTest {
         BpeTokenizer tok = loadTokenizer();
         String text = "你好，世界！emoji 😀";
         int[] ids = tok.encode(text);
-        BpeTokenizer.IncrementalDecoder dec = tok.incrementalDecoder();
+        IncrementalDecoder dec = tok.incrementalDecoder();
         StringBuilder sb = new StringBuilder();
         for (int id : ids) {
             sb.append(dec.accept(id));
