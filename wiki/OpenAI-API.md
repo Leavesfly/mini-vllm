@@ -30,7 +30,7 @@ server.setExecutor(Executors.newFixedThreadPool(Math.max(16, maxNumSeqs * 4)));
 boolean enableThinking = Boolean.TRUE.equals(req.get("enable_thinking"));
 String prompt = extractPrompt(req, enableThinking);
 boolean stream = Boolean.TRUE.equals(req.get("stream"));
-int maxTokens   = intOr(req.get("max_tokens"), 512);
+int maxTokens   = intOr(req.get("max_tokens"), 2048);
 float temperature = (float) doubleOr(req.get("temperature"), 0.8);
 float topP      = (float) doubleOr(req.get("top_p"), 0.9);
 int topK        = intOr(req.get("top_k"), 0);
@@ -40,7 +40,7 @@ int topK        = intOr(req.get("top_k"), 0);
 |---|---|---|
 | `messages` | — | 对话数组（有则走 ChatML）；也支持 `prompt` 纯文本字段 |
 | `stream` | false | true 走 SSE 流式 |
-| `max_tokens` | 512 | 最大生成 token 数 |
+| `max_tokens` | 2048 | 最大生成 token 数 |
 | `temperature` | 0.8 | 采样温度（≤1e-3 退化为 greedy） |
 | `top_p` | 0.9 | nucleus 采样 |
 | `top_k` | 0 | top-k 采样（0=不限制） |

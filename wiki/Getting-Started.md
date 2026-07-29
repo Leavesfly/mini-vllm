@@ -155,7 +155,7 @@ curl -s -X POST http://localhost:8080/v1/chat/completions \
   -d '{"model":"mini-vllm","messages":[{"role":"user","content":"9.11 和 9.9 哪个大"}],"enable_thinking":true}'
 ```
 
-请求参数：`messages`、`stream`、`max_tokens`（默认 512）、`temperature`（默认 0.8）、`top_p`（默认 0.9）、`top_k`、`enable_thinking`（默认 false）。详见 [OpenAI-API](OpenAI-API.md)。
+请求参数：`messages`、`stream`、`max_tokens`（默认 2048）、`temperature`（默认 0.8）、`top_p`（默认 0.9）、`top_k`、`enable_thinking`（默认 false）。详见 [OpenAI-API](OpenAI-API.md)。
 
 ### Web 对话页
 

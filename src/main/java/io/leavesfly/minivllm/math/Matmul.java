@@ -5,6 +5,7 @@ import java.util.List;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.IntConsumer;
 
 /**
@@ -128,7 +129,11 @@ public final class Matmul {
      * total < threshold 或单核时串行。用于"列数少但每列开销大"的场景
      *（如多头注意力：nHead 仅十几个，但长上下文时每头计算量大，值得并行）。
      *
-     * 性能优化：当前线程参与第 0 块计算（而非空等），充分利用调用方 CPU 时间。
+     * 性能优化：
+     * 1. 当前线程同样参与领取分块（而非空等），充分利用调用方 CPU 时间。
+     * 2. 动态分块（原子计数器领取）而非静态均分：异构大小核（如 Apple Silicon
+     *    的 P/E 核）下静态均分会让快核算完后空等慢核，动态领取小块使快核自然
+     *    多干活，尾部等待时间接近于单块耗时。块内行连续，缓存友好性不变。
      */
     public static void parallelRows(int total, int threshold, IntConsumer rowTask) {
         if (total < threshold || CORES == 1) {
@@ -138,24 +143,24 @@ public final class Matmul {
             return;
         }
         int t = Math.min(CORES, total);
-        int per = (total + t - 1) / t;
-        // 分发 chunks 1..t-1 到线程池，当前线程处理 chunk 0
-        List<Future<?>> futures = new ArrayList<>(t - 1);
-        for (int i = 1; i < t; i++) {
-            int from = i * per;
-            int to = Math.min(from + per, total);
-            if (from >= to) break;
-            futures.add(POOL.submit(() -> {
+        // 块大小：每线程平均领 4 块，兼顾负载均衡粒度与领取开销（领取次数至多 4t，原子开销可忽略）
+        int chunk = Math.max(1, (total + t * 4 - 1) / (t * 4));
+        AtomicInteger cursor = new AtomicInteger(0);
+        Runnable worker = () -> {
+            int from;
+            while ((from = cursor.getAndAdd(chunk)) < total) {
+                int to = Math.min(from + chunk, total);
                 for (int r = from; r < to; r++) {
                     rowTask.accept(r);
                 }
-            }));
+            }
+        };
+        // 分发 t-1 个 worker 到线程池，当前线程也作为一个 worker 参与领取
+        List<Future<?>> futures = new ArrayList<>(t - 1);
+        for (int i = 1; i < t; i++) {
+            futures.add(POOL.submit(worker));
         }
-        // 当前线程处理第 0 块（不浪费等待时间）
-        int end0 = Math.min(per, total);
-        for (int r = 0; r < end0; r++) {
-            rowTask.accept(r);
-        }
+        worker.run();
         // 等待其余线程完成
         for (Future<?> f : futures) {
             try {

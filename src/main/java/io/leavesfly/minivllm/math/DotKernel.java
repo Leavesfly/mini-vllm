@@ -1,5 +1,6 @@
 package io.leavesfly.minivllm.math;
 
+import jdk.incubator.vector.ByteVector;
 import jdk.incubator.vector.FloatVector;
 import jdk.incubator.vector.IntVector;
 import jdk.incubator.vector.ShortVector;
@@ -100,6 +101,10 @@ final class ScalarDotKernel implements DotKernel {
  * 按硬件优选物种（SPECIES_PREFERRED）的 lane 宽度分块：
  * 主循环用 fma（乘加融合）累积到向量累加器，最后 reduceLanes 归约，
  * 不足一个 lane 宽度的尾部用标量处理。
+ *
+ * 性能关键：多累加器展开（4 路）。FMA 指令延迟 ~3-4 周期，单累加器存在
+ * 串行依赖链（每次 fma 必须等上一次完成），单核吞吐仅峰值的 ~25%；
+ * 4 个独立累加器可填满流水线，在 Apple Silicon（NEON 128-bit）上接近 4× 单核提速。
  */
 final class VectorDotKernel implements DotKernel {
 
@@ -113,17 +118,43 @@ final class VectorDotKernel implements DotKernel {
             VectorSpecies.of(short.class, VectorShape.forBitSize(SPECIES.vectorBitSize() / 2));
     private static final VectorSpecies<Integer> INT_SPECIES =
             VectorSpecies.of(int.class, SPECIES.vectorShape());
+    /**
+     * int8 路径的 byte/short 物种：一次加载 2N 个 byte（N = float lane 数）。
+     * byte 取 vectorBitSize/2 形状（最小 64-bit，避开 32-bit 非法形状陷阱），
+     * B2S 加宽到满宽 short（2N lanes），再 S2I 分 part 0/1 得两组 int，I2F 转 float。
+     * 注意：不可用 B2F 一步转换（非硬件直接支持，JIT 会退化为逐 lane 标量循环，
+     * 实测慢 ~50×）；B2S/S2I/I2F 均有对应硬件指令，全链路寄存器内完成。
+     */
+    private static final VectorSpecies<Byte> BYTE_SPECIES =
+            VectorSpecies.of(byte.class, VectorShape.forBitSize(SPECIES.vectorBitSize() / 2));
+    private static final VectorSpecies<Short> SHORT_FULL_SPECIES =
+            VectorSpecies.of(short.class, SPECIES.vectorShape());
 
     @Override
     public float dot(float[] a, int aOff, float[] b, int bOff, int len) {
         int i = 0;
-        FloatVector acc = FloatVector.zero(SPECIES);
-        for (; i < SPECIES.loopBound(len); i += SPECIES.length()) {
-            FloatVector va = FloatVector.fromArray(SPECIES, a, aOff + i);
-            FloatVector vb = FloatVector.fromArray(SPECIES, b, bOff + i);
-            acc = va.fma(vb, acc);
+        int lanes = SPECIES.length();
+        int step = lanes * 4;
+        // 4 路独立累加器：打破 FMA 延迟链，填满流水线
+        FloatVector acc0 = FloatVector.zero(SPECIES);
+        FloatVector acc1 = FloatVector.zero(SPECIES);
+        FloatVector acc2 = FloatVector.zero(SPECIES);
+        FloatVector acc3 = FloatVector.zero(SPECIES);
+        for (int bound4 = len - len % step; i < bound4; i += step) {
+            acc0 = FloatVector.fromArray(SPECIES, a, aOff + i)
+                    .fma(FloatVector.fromArray(SPECIES, b, bOff + i), acc0);
+            acc1 = FloatVector.fromArray(SPECIES, a, aOff + i + lanes)
+                    .fma(FloatVector.fromArray(SPECIES, b, bOff + i + lanes), acc1);
+            acc2 = FloatVector.fromArray(SPECIES, a, aOff + i + lanes * 2)
+                    .fma(FloatVector.fromArray(SPECIES, b, bOff + i + lanes * 2), acc2);
+            acc3 = FloatVector.fromArray(SPECIES, a, aOff + i + lanes * 3)
+                    .fma(FloatVector.fromArray(SPECIES, b, bOff + i + lanes * 3), acc3);
         }
-        float sum = acc.reduceLanes(VectorOperators.ADD);
+        for (; i < SPECIES.loopBound(len); i += lanes) {
+            acc0 = FloatVector.fromArray(SPECIES, a, aOff + i)
+                    .fma(FloatVector.fromArray(SPECIES, b, bOff + i), acc0);
+        }
+        float sum = acc0.add(acc1).add(acc2.add(acc3)).reduceLanes(VectorOperators.ADD);
         for (; i < len; i++) {
             sum += a[aOff + i] * b[bOff + i];
         }
@@ -133,47 +164,63 @@ final class VectorDotKernel implements DotKernel {
     @Override
     public float dotBf16(short[] a, int aOff, float[] b, int bOff, int len) {
         int i = 0;
-        FloatVector acc = FloatVector.zero(SPECIES);
         int lanes = SPECIES.length();
-        int bound = SPECIES.loopBound(len);
-        for (; i < bound; i += lanes) {
-            // 1) 加载 lanes 个 bf16（short）
-            ShortVector sv = ShortVector.fromArray(SHORT_SPECIES, a, aOff + i);
-            // 2) short -> int（符号扩展，lane 数不变，形状扩宽 16->32）
-            IntVector iv = (IntVector) sv.convertShape(VectorOperators.S2I, INT_SPECIES, 0);
-            // 3) 左移 16 位得 f32 位模式，再重解释为 float
-            FloatVector wv = iv.lanewise(VectorOperators.LSHL, 16).reinterpretAsFloats();
-            FloatVector xv = FloatVector.fromArray(SPECIES, b, bOff + i);
-            acc = wv.fma(xv, acc);
+        int step = lanes * 4;
+        // 4 路独立累加器（同 dot）：bf16 转换链（加载/S2I/LSHL）与 FMA 交错填满流水线
+        FloatVector acc0 = FloatVector.zero(SPECIES);
+        FloatVector acc1 = FloatVector.zero(SPECIES);
+        FloatVector acc2 = FloatVector.zero(SPECIES);
+        FloatVector acc3 = FloatVector.zero(SPECIES);
+        for (int bound4 = len - len % step; i < bound4; i += step) {
+            acc0 = loadBf16(a, aOff + i).fma(FloatVector.fromArray(SPECIES, b, bOff + i), acc0);
+            acc1 = loadBf16(a, aOff + i + lanes)
+                    .fma(FloatVector.fromArray(SPECIES, b, bOff + i + lanes), acc1);
+            acc2 = loadBf16(a, aOff + i + lanes * 2)
+                    .fma(FloatVector.fromArray(SPECIES, b, bOff + i + lanes * 2), acc2);
+            acc3 = loadBf16(a, aOff + i + lanes * 3)
+                    .fma(FloatVector.fromArray(SPECIES, b, bOff + i + lanes * 3), acc3);
         }
-        float sum = acc.reduceLanes(VectorOperators.ADD);
+        for (; i < SPECIES.loopBound(len); i += lanes) {
+            acc0 = loadBf16(a, aOff + i).fma(FloatVector.fromArray(SPECIES, b, bOff + i), acc0);
+        }
+        float sum = acc0.add(acc1).add(acc2.add(acc3)).reduceLanes(VectorOperators.ADD);
         for (; i < len; i++) {
             sum += Float.intBitsToFloat(a[aOff + i] << 16) * b[bOff + i];
         }
         return sum;
     }
 
+    /** 加载 lanes 个 bf16 位并加宽为 f32 向量：short -> int（S2I）-> 左移 16 -> 重解释 float */
+    private static FloatVector loadBf16(short[] a, int off) {
+        ShortVector sv = ShortVector.fromArray(SHORT_SPECIES, a, off);
+        IntVector iv = (IntVector) sv.convertShape(VectorOperators.S2I, INT_SPECIES, 0);
+        return iv.lanewise(VectorOperators.LSHL, 16).reinterpretAsFloats();
+    }
+
     @Override
     public float dotInt8(byte[] w, int wOff, float[] x, int xOff, int len, float scale) {
-        // 混合 SIMD 路径：标量 byte->float 转换（lanes 次操作在 L1 内）+ 向量 FMA 累加。
-        // 带宽收益：权重每元素仅 1 字节（bf16 为 2 字节），主循环内存读取减半；
-        // 转换开销极低（4 次 byte->float 在寄存器内完成），FMA 仍用 SIMD 宽通道。
+        // 全向量化路径：一次加载 2N 个 byte，B2S 加宽到满宽 short，再 S2I 分 part 0/1
+        // 得两组 int，I2F 转 float 后 FMA（各步均有硬件指令，勿用会退化标量的 B2F）。
+        // 转换全在寄存器内完成，无标量中转缓冲；双累加器打破 FMA 延迟链。
+        // 带宽收益：权重每元素仅 1 字节（bf16 的一半）。
         int i = 0;
-        FloatVector acc = FloatVector.zero(SPECIES);
         int lanes = SPECIES.length();
-        int bound = SPECIES.loopBound(len);
-        float[] tmp = new float[lanes]; // 小缓冲，逃逸优化后栈上分配
-        for (; i < bound; i += lanes) {
-            // 标量转换：lanes 个 int8 -> float（带宽节省的核心：只读 lanes 字节）
-            for (int j = 0; j < lanes; j++) {
-                tmp[j] = (float) w[wOff + i + j];
-            }
-            // SIMD FMA：与 bf16/f32 路径同构的向量乘加
-            FloatVector fv = FloatVector.fromArray(SPECIES, tmp, 0);
-            FloatVector xv = FloatVector.fromArray(SPECIES, x, xOff + i);
-            acc = fv.fma(xv, acc);
+        int step = lanes * 2; // 每轮处理 2N 元素（一次 byte 向量加载）
+        FloatVector acc0 = FloatVector.zero(SPECIES);
+        FloatVector acc1 = FloatVector.zero(SPECIES);
+        for (int bound2 = len - len % step; i < bound2; i += step) {
+            ByteVector bv = ByteVector.fromArray(BYTE_SPECIES, w, wOff + i);
+            ShortVector sv = (ShortVector) bv.convertShape(VectorOperators.B2S, SHORT_FULL_SPECIES, 0);
+            FloatVector f0 = (FloatVector) ((IntVector) sv
+                    .convertShape(VectorOperators.S2I, INT_SPECIES, 0))
+                    .convert(VectorOperators.I2F, 0);
+            FloatVector f1 = (FloatVector) ((IntVector) sv
+                    .convertShape(VectorOperators.S2I, INT_SPECIES, 1))
+                    .convert(VectorOperators.I2F, 0);
+            acc0 = f0.fma(FloatVector.fromArray(SPECIES, x, xOff + i), acc0);
+            acc1 = f1.fma(FloatVector.fromArray(SPECIES, x, xOff + i + lanes), acc1);
         }
-        float sum = acc.reduceLanes(VectorOperators.ADD);
+        float sum = acc0.add(acc1).reduceLanes(VectorOperators.ADD);
         for (; i < len; i++) {
             sum += (float) w[wOff + i] * x[xOff + i];
         }

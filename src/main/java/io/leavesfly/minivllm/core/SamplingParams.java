@@ -17,7 +17,7 @@ package io.leavesfly.minivllm.core;
 public record SamplingParams(int maxTokens, float temperature, int topK, float topP) {
 
     /** 全局默认采样参数（OpenAI API 未显式传参时使用） */
-    public static final SamplingParams DEFAULT = new SamplingParams(512, 0.8f, 0, 0.9f);
+    public static final SamplingParams DEFAULT = new SamplingParams(2048, 0.8f, 0, 0.9f);
 
     public SamplingParams {
         if (maxTokens <= 0) {
