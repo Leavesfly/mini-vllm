@@ -16,6 +16,8 @@ import java.util.List;
  *    不自动补默认 system（与 HF apply_chat_template 严格对齐）。
  * 3. <|im_start|> / <|im_end|> 是 special token，由 BpeTokenizer 直接映射 id，
  *    不参与 BPE 合并。
+ * 4. 历史 assistant 消息只保留正式答案，丢弃上一轮的思考内容 —— 这是 Qwen3 官方模板的
+ *    行为，也避免把带 </think> 的原始输出原样喂回模型、让提示词偏离训练分布。
  */
 public final class Qwen3ChatMLTemplate implements ChatTemplate {
 
@@ -24,6 +26,7 @@ public final class Qwen3ChatMLTemplate implements ChatTemplate {
     /** Qwen3 思考模式标记 */
     public static final String THINK_OPEN = "<think>";
     public static final String THINK_CLOSE = "</think>";
+    private static final String ASSISTANT = "assistant";
 
     /**
      * 渲染 messages 为 ChatML 提示词（以 assistant 生成起点结尾）。
@@ -36,10 +39,13 @@ public final class Qwen3ChatMLTemplate implements ChatTemplate {
     public String render(List<Message> messages, boolean enableThinking) {
         var sb = new StringBuilder();
         for (var m : messages) {
+            String content = ASSISTANT.equals(m.role())
+                    ? ThinkParts.split(m.content()).answer()
+                    : m.content();
             sb.append(IM_START).append(m.role()).append('\n')
-                    .append(m.content()).append(IM_END).append('\n');
+                    .append(content).append(IM_END).append('\n');
         }
-        sb.append(IM_START).append("assistant\n");
+        sb.append(IM_START).append(ASSISTANT).append('\n');
         if (!enableThinking) {
             sb.append(THINK_OPEN).append("\n\n").append(THINK_CLOSE).append("\n\n");
         }

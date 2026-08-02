@@ -2,7 +2,8 @@ package io.leavesfly.minivllm.api;
 
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpHandler;
-import io.leavesfly.minivllm.core.LLMEngine;
+import io.leavesfly.minivllm.core.ModelHub;
+import io.leavesfly.minivllm.core.ModelRuntime;
 import io.leavesfly.minivllm.core.SamplingParams;
 import io.leavesfly.minivllm.core.Sequence;
 import io.leavesfly.minivllm.json.SimpleJson;
@@ -26,25 +27,22 @@ import java.util.Map;
  * 1. 用 JDK 自带 com.sun.net.httpserver.HttpServer，零依赖实现 HTTP 服务。
  * 2. 兼容 OpenAI 两个核心端点：
  *      POST /v1/chat/completions —— 支持 stream(true/false)、max_tokens、temperature、top_p、top_k
- *      GET  /v1/models           —— 返回模型列表
+ *      GET  /v1/models           —— 返回模型列表（含是否已加载，供 Web 页面标注）
  * 3. 流式：每个 token 经 onToken 回调通过 SseWriter 推送一个 chunk，最后发 [DONE]。
  *    非流式：收集所有 token 后一次性返回完整 JSON。
  * 4. handler 线程阻塞等待 Sequence 完成（engine 线程异步推进 step），体现了请求与引擎的解耦。
- * 5. 对话模板经构造器注入 ChatTemplate 接口：本类不感知具体模型的 prompt 格式。
+ * 5. 多模型：请求体 model 字段经 {@link ModelHub} 路由到对应 {@link ModelRuntime}，
+ *    引擎、分词器、对话模板都取自被选中的运行时，本类不感知具体模型的 prompt 格式。
  */
 public final class OpenAiHandler implements HttpHandler {
 
     private static final int MAX_BODY_BYTES = 1 << 20; // 1MB 请求体上限
     private static final int READ_BUFFER_SIZE = 8192;
 
-    private final LLMEngine engine;
-    private final String modelName;
-    private final ChatTemplate chatTemplate;
+    private final ModelHub hub;
 
-    public OpenAiHandler(LLMEngine engine, String modelName, ChatTemplate chatTemplate) {
-        this.engine = engine;
-        this.modelName = modelName;
-        this.chatTemplate = chatTemplate;
+    public OpenAiHandler(ModelHub hub) {
+        this.hub = hub;
     }
 
     @Override
@@ -71,18 +69,22 @@ public final class OpenAiHandler implements HttpHandler {
 
     private void handleChatCompletions(HttpExchange exchange) throws IOException {
         String body = readBody(exchange);
-        @SuppressWarnings("unchecked")
         Map<String, Object> req = SimpleJson.parseObject(body);
 
+        // 按 model 字段选择运行时；未注册的 id 抛 IllegalArgumentException → 400。
+        // 该模型尚未加载时，本调用会同步完成加载（首次切换模型的等待就发生在这里）
+        Object model = req.get("model");
+        ModelRuntime runtime = hub.get(model == null ? null : model.toString());
+
         boolean enableThinking = Boolean.TRUE.equals(req.get("enable_thinking"));
-        String prompt = extractPrompt(req, enableThinking);
+        String prompt = extractPrompt(runtime.chatTemplate(), req, enableThinking);
         boolean stream = Boolean.TRUE.equals(req.get("stream"));
         SamplingParams params = parseSamplingParams(req);
 
         if (stream) {
-            handleStream(exchange, prompt, params);
+            handleStream(exchange, runtime, prompt, params);
         } else {
-            handleNonStream(exchange, prompt, params);
+            handleNonStream(exchange, runtime, prompt, params);
         }
     }
 
@@ -97,22 +99,22 @@ public final class OpenAiHandler implements HttpHandler {
     }
 
     /** 流式：边生成边推送 SSE chunk */
-    private void handleStream(HttpExchange exchange, String prompt, SamplingParams params)
-            throws IOException {
+    private void handleStream(HttpExchange exchange, ModelRuntime runtime, String prompt,
+                              SamplingParams params) throws IOException {
         SseWriter sse = new SseWriter(exchange);
         String id = "chatcmpl-" + System.currentTimeMillis();
         long created = System.currentTimeMillis() / 1000;
         try {
-            Sequence seq = engine.addRequest(prompt, params, token -> {
+            Sequence seq = runtime.engine().addRequest(prompt, params, token -> {
                 try {
-                    sse.write(streamChunk(id, created, token, null));
+                    sse.write(streamChunk(runtime.id(), id, created, token, null));
                 } catch (IOException ignored) {
                     // 客户端可能已断开
                 }
             });
             seq.awaitDone();
             // 结束 chunk
-            sse.write(streamChunk(id, created, "", "stop"));
+            sse.write(streamChunk(runtime.id(), id, created, "", "stop"));
             sse.finish();
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
@@ -123,10 +125,10 @@ public final class OpenAiHandler implements HttpHandler {
     }
 
     /** 非流式：等全部生成后返回完整 JSON */
-    private void handleNonStream(HttpExchange exchange, String prompt, SamplingParams params)
-            throws IOException {
+    private void handleNonStream(HttpExchange exchange, ModelRuntime runtime, String prompt,
+                                 SamplingParams params) throws IOException {
         List<String> collected = Collections.synchronizedList(new ArrayList<>());
-        Sequence seq = engine.addRequest(prompt, params, collected::add);
+        Sequence seq = runtime.engine().addRequest(prompt, params, collected::add);
         try {
             seq.awaitDone();
         } catch (InterruptedException e) {
@@ -137,17 +139,20 @@ public final class OpenAiHandler implements HttpHandler {
         long created = System.currentTimeMillis() / 1000;
         int promptTokens = seq.promptTokens().length;
         int completionTokens = seq.outputTokens().size();
-        String json = completionJson(id, created, text, promptTokens, completionTokens);
+        String json = completionJson(runtime.id(), id, created, text, promptTokens, completionTokens);
         sendJson(exchange, 200, json);
     }
 
+    /**
+     * 模型列表：除 OpenAI 标准字段外，额外给出 loaded / default，
+     * 让 Web 页面能标注「待加载」并选中默认模型（懒加载下这两点用户可感知）。
+     */
     private void handleModels(HttpExchange exchange) throws IOException {
-        Map<String, Object> model = new LinkedHashMap<>();
-        model.put("id", modelName);
-        model.put("object", "model");
-        model.put("owned_by", "mini-vllm");
         List<Object> data = new ArrayList<>();
-        data.add(model);
+        for (String id : hub.ids()) {
+            data.add(map("id", id, "object", "model", "owned_by", "mini-vllm",
+                    "loaded", hub.isLoaded(id), "default", id.equals(hub.defaultId())));
+        }
         Map<String, Object> resp = new LinkedHashMap<>();
         resp.put("object", "list");
         resp.put("data", data);
@@ -156,7 +161,8 @@ public final class OpenAiHandler implements HttpHandler {
 
     // ─── 响应 JSON 构造 ───
 
-    private String streamChunk(String id, long created, String content, String finishReason) {
+    private String streamChunk(String modelId, String id, long created, String content,
+                               String finishReason) {
         Map<String, Object> delta = new LinkedHashMap<>();
         if (!content.isEmpty()) {
             delta.put("content", content);
@@ -164,12 +170,12 @@ public final class OpenAiHandler implements HttpHandler {
         Map<String, Object> choice = map("index", 0, "delta", delta, "finish_reason", finishReason);
         Map<String, Object> chunk = map(
                 "id", id, "object", "chat.completion.chunk",
-                "created", created, "model", modelName,
+                "created", created, "model", modelId,
                 "choices", List.of(choice));
         return SimpleJson.stringify(chunk);
     }
 
-    private String completionJson(String id, long created, String content,
+    private String completionJson(String modelId, String id, long created, String content,
                                   int promptTokens, int completionTokens) {
         Map<String, Object> message = map("role", "assistant", "content", content);
         Map<String, Object> choice = map("index", 0, "message", message, "finish_reason", "stop");
@@ -179,7 +185,7 @@ public final class OpenAiHandler implements HttpHandler {
                 "total_tokens", promptTokens + completionTokens);
         Map<String, Object> resp = map(
                 "id", id, "object", "chat.completion",
-                "created", created, "model", modelName,
+                "created", created, "model", modelId,
                 "choices", List.of(choice), "usage", usage);
         return SimpleJson.stringify(resp);
     }
@@ -197,11 +203,12 @@ public final class OpenAiHandler implements HttpHandler {
 
     /**
      * 从 messages 数组构造 prompt：
-     * - messages 模式：由注入的 ChatTemplate 渲染（Qwen3 为 ChatML，微模型为纯文本）
+     * - messages 模式：由被选中模型的 ChatTemplate 渲染（Qwen3 为 ChatML，微模型为纯文本）
      * - 纯文本模式（prompt 字段）：原样返回
      */
     @SuppressWarnings("unchecked")
-    private String extractPrompt(Map<String, Object> req, boolean enableThinking) {
+    private static String extractPrompt(ChatTemplate chatTemplate, Map<String, Object> req,
+                                        boolean enableThinking) {
         Object msgs = req.get("messages");
         if (msgs == null) {
             // 纯文本 prompt（学习用微模型）：不套对话模板，原样返回

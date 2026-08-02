@@ -60,6 +60,27 @@
   .dot.ok { background: #30a46c; }
   .dot.err { background: var(--danger); }
 
+  /* 模型选择 */
+  .model-pick { position: relative; display: flex; align-items: center; flex-shrink: 0; }
+  .model-pick::after {
+    content: "▾"; position: absolute; right: 11px;
+    font-size: 10px; color: var(--text-2); pointer-events: none;
+  }
+  .model-pick select {
+    appearance: none; -webkit-appearance: none;
+    font: inherit; font-size: 12.5px; color: var(--text);
+    background: var(--card); border: 1px solid var(--border); border-radius: 999px;
+    padding: 5px 26px 5px 12px; max-width: 250px;
+    cursor: pointer; transition: background .15s, border-color .15s;
+  }
+  .model-pick select:hover { background: var(--accent-soft); border-color: #cfdeda; }
+  .model-pick select:disabled { opacity: .5; cursor: default; }
+
+  @media (max-width: 620px) {
+    .subtitle { display: none; }
+    .status span:last-child { display: none; }
+  }
+
   /* ---------- 主区域 ---------- */
   main {
     width: 100%; max-width: 780px;
@@ -127,6 +148,14 @@
   .msg.error .bubble {
     background: #fdf3f2; border: 1px solid #f0d9d7; color: var(--danger);
   }
+
+  /* 思考过程（闭合标记之前的内容） */
+  .think {
+    border-left: 2px solid var(--border);
+    padding-left: 10px; margin-bottom: 8px;
+    font-size: 13px; line-height: 1.6; color: var(--text-2);
+  }
+  .think-label { display: block; font-size: 11.5px; margin-bottom: 2px; opacity: .75; }
 
   /* ---------- 设置面板 ---------- */
   .panel {
@@ -214,6 +243,9 @@
       <div class="title">mini-vllm 对话演示</div>
       <div class="subtitle">PagedAttention · Continuous Batching · 纯 Java 推理</div>
     </div>
+    <div class="model-pick" title="切换模型（标注「待加载」的模型首次对话时才载入权重）">
+      <select id="modelSel" aria-label="选择模型"></select>
+    </div>
     <div class="status"><span class="dot" id="statusDot"></span><span id="statusText">连接中…</span></div>
   </div>
 </header>
@@ -223,7 +255,7 @@
     <div class="empty" id="emptyState">
       <div class="empty-icon">💬</div>
       <h2>与本地模型对话</h2>
-      <p>输入消息开始对话，token 将逐字流式输出。<br>所有推理均在本机由 mini-vllm 引擎完成。</p>
+      <p>输入消息开始对话，token 将逐字流式输出。<br>右上角可切换模型，所有推理均在本机由 mini-vllm 引擎完成。</p>
       <div class="suggestions">
         <button class="suggestion" data-q="你好，请介绍一下你自己">你好，请介绍一下你自己</button>
         <button class="suggestion" data-q="用一句话解释什么是注意力机制">用一句话解释什么是注意力机制</button>
@@ -281,26 +313,79 @@
   var settingsPanel = document.getElementById("settingsPanel");
   var statusDot = document.getElementById("statusDot");
   var statusText = document.getElementById("statusText");
+  var modelSel = document.getElementById("modelSel");
 
   var messages = [];        // 多轮对话历史 {role, content}
   var generating = false;
   var abortCtrl = null;
+  var models = [];          // /v1/models 返回的模型列表 {id, loaded}
+  var currentModel = "";    // 当前选中模型，作为请求的 model 字段
+  var MODEL_KEY = "minivllm.model";
 
-  // ---------- 服务状态检测 ----------
-  function checkHealth() {
-    fetch("/v1/models").then(function (r) {
+  // ---------- 服务状态与模型列表 ----------
+  function setStatus(kind, text) {
+    statusDot.className = "dot" + (kind ? " " + kind : "");
+    statusText.textContent = text;
+  }
+
+  function findModel(id) {
+    for (var i = 0; i < models.length; i++) {
+      if (models[i].id === id) return models[i];
+    }
+    return null;
+  }
+
+  /** 模型尚未加载时标注「待加载」：提示首次对话需等权重载入 */
+  function renderModelOptions() {
+    modelSel.innerHTML = "";
+    models.forEach(function (m) {
+      var opt = document.createElement("option");
+      opt.value = m.id;
+      opt.textContent = m.id + (m.loaded ? "" : " · 待加载");
+      modelSel.appendChild(opt);
+    });
+    modelSel.value = currentModel;
+  }
+
+  function describeModelStatus() {
+    var m = findModel(currentModel);
+    if (m && !m.loaded) {
+      setStatus("ok", "待加载 · 首次对话需载入权重");
+    } else {
+      setStatus("ok", "已连接");
+    }
+  }
+
+  /** 拉取模型列表（兼作健康检测），保留上次选择，否则用服务端默认模型 */
+  function loadModels() {
+    return fetch("/v1/models").then(function (r) {
       if (!r.ok) throw new Error();
       return r.json();
     }).then(function (d) {
-      var name = (d.data && d.data[0] && d.data[0].id) || "mini-vllm";
-      statusDot.className = "dot ok";
-      statusText.textContent = "已连接 · " + name;
+      models = (d.data || []).map(function (m) {
+        return { id: m.id, loaded: m.loaded !== false, isDefault: m["default"] === true };
+      });
+      if (!models.length) throw new Error();
+      if (!findModel(currentModel)) {
+        var preferred = null;
+        try { preferred = localStorage.getItem(MODEL_KEY); } catch (e) { /* 禁用存储 */ }
+        var fallback = models.filter(function (m) { return m.isDefault; })[0] || models[0];
+        currentModel = findModel(preferred) ? preferred : fallback.id;
+      }
+      renderModelOptions();
+      describeModelStatus();
     }).catch(function () {
-      statusDot.className = "dot err";
-      statusText.textContent = "服务不可用";
+      setStatus("err", "服务不可用");
     });
   }
-  checkHealth();
+  loadModels();
+
+  modelSel.addEventListener("change", function () {
+    currentModel = modelSel.value;
+    try { localStorage.setItem(MODEL_KEY, currentModel); } catch (e) { /* 禁用存储 */ }
+    describeModelStatus();
+    input.focus();
+  });
 
   // ---------- 参数滑块 ----------
   function bindSlider(id, outId, fmt) {
@@ -345,6 +430,62 @@
     scrollBottom();
   }
 
+  var THINK_OPEN = "<think>";
+  var THINK_CLOSE = "</think>";
+
+  // assistant 气泡：思考块 + 正式答案两段结构
+  function addAssistantMsg() {
+    hideEmpty();
+    var wrap = document.createElement("div");
+    wrap.className = "msg assistant";
+    var bubble = document.createElement("div");
+    bubble.className = "bubble";
+    var think = document.createElement("div");
+    think.className = "think";
+    think.style.display = "none";
+    var label = document.createElement("span");
+    label.className = "think-label";
+    label.textContent = "思考过程";
+    var thinkText = document.createElement("span");
+    think.appendChild(label);
+    think.appendChild(thinkText);
+    var answer = document.createElement("span");
+    bubble.appendChild(think);
+    bubble.appendChild(answer);
+    wrap.appendChild(bubble);
+    chat.appendChild(wrap);
+    scrollBottom();
+    return { wrap: wrap, bubble: bubble, think: think, thinkText: thinkText, answer: answer };
+  }
+
+  // 只留开启标记之后的正文（模型自己生成开启标记时），并去掉首尾换行
+  function stripThinkOpen(s) {
+    var open = s.lastIndexOf(THINK_OPEN);
+    if (open >= 0) s = s.slice(open + THINK_OPEN.length);
+    return s.replace(/^\n+/, "").replace(/\n+$/, "");
+  }
+
+  /**
+   * 把原始输出切成思考/答案两段并渲染。
+   * 思考模式下开启标记可能是模板预填的（不出现在输出里），
+   * 因此以闭合标记为切分依据；尚未闭合时整段都算思考内容。
+   */
+  function renderAnswer(view, text, thinking) {
+    var reasoning = "";
+    var answer = text;
+    var close = text.indexOf(THINK_CLOSE);
+    if (close >= 0) {
+      reasoning = stripThinkOpen(text.slice(0, close));
+      answer = text.slice(close + THINK_CLOSE.length).replace(/^\n+/, "");
+    } else if (thinking) {
+      reasoning = stripThinkOpen(text);
+      answer = "";
+    }
+    view.think.style.display = reasoning ? "" : "none";
+    view.thinkText.textContent = reasoning;
+    view.answer.textContent = answer;
+  }
+
   // ---------- 输入框自适应 ----------
   function autosize() {
     input.style.height = "auto";
@@ -362,6 +503,7 @@
   // ---------- 发送与流式接收 ----------
   function setGenerating(on) {
     generating = on;
+    modelSel.disabled = on; // 生成中锁定模型，避免与当前回答对不上
     if (on) {
       sendBtn.textContent = "■";
       sendBtn.classList.add("stop");
@@ -409,14 +551,16 @@
     messages.push({ role: "user", content: text });
     addMsg("user", text);
 
-    var bubble = addMsg("assistant", "");
-    bubble.classList.add("streaming");
+    var view = addAssistantMsg();
+    view.bubble.classList.add("streaming");
 
+    var thinking = document.getElementById("thinkToggle").checked;
+    var model = currentModel;
     var body = {
-      model: "mini-vllm",
+      model: model,
       messages: messages.slice(),
       stream: true,
-      enable_thinking: document.getElementById("thinkToggle").checked,
+      enable_thinking: thinking,
       temperature: parseFloat(document.getElementById("temp").value),
       top_p: parseFloat(document.getElementById("topP").value),
       max_tokens: parseInt(document.getElementById("maxTok").value, 10)
@@ -428,6 +572,11 @@
     var answer = "";
     var chunks = 0;
     var stopped = false;
+    // 首次使用某模型时，服务端会先同步载入权重，首个 token 会明显变慢
+    var awaitingLoad = !(findModel(model) || {}).loaded;
+    if (awaitingLoad) {
+      setStatus("", "正在载入 " + model + " 的权重…");
+    }
 
     fetch("/v1/chat/completions", {
       method: "POST",
@@ -435,7 +584,8 @@
       body: JSON.stringify(body),
       signal: abortCtrl.signal
     }).then(function (resp) {
-      if (!resp.ok || !resp.body) throw new Error("HTTP " + resp.status);
+      if (!resp.ok) return failWithServerMessage(resp);
+      if (!resp.body) throw new Error("HTTP " + resp.status);
       var reader = resp.body.pipeThrough(new TextDecoderStream()).getReader();
       var buf = "";
 
@@ -455,9 +605,13 @@
               var delta = obj.choices && obj.choices[0] && obj.choices[0].delta;
               var piece = (delta && delta.content) || "";
               if (piece) {
+                if (awaitingLoad) { // 首个 token 到达 = 权重已就绪
+                  awaitingLoad = false;
+                  loadModels();
+                }
                 answer += piece;
                 chunks++;
-                bubble.textContent = answer;
+                renderAnswer(view, answer, thinking);
                 scrollBottom();
               }
             } catch (e) { /* 忽略不完整 chunk */ }
@@ -470,30 +624,40 @@
       if (err && err.name === "AbortError") {
         stopped = true;
       } else {
-        bubble.classList.remove("streaming");
+        view.bubble.classList.remove("streaming");
         if (!answer) {
-          bubble.textContent = "请求失败：" + (err && err.message ? err.message : "网络错误");
-          bubble.parentElement.classList.add("error");
+          view.answer.textContent = "请求失败：" + (err && err.message ? err.message : "网络错误");
+          view.wrap.classList.add("error");
         }
       }
     }).then(function () {
-      bubble.classList.remove("streaming");
+      view.bubble.classList.remove("streaming");
       var elapsed = (performance.now() - t0) / 1000;
       if (answer) {
         messages.push({ role: "assistant", content: answer });
         var meta = document.createElement("div");
         meta.className = "meta";
         var speed = elapsed > 0 ? (chunks / elapsed).toFixed(1) : "0";
-        meta.textContent = chunks + " tokens · " + elapsed.toFixed(1) + " s · " +
+        meta.textContent = model + " · " + chunks + " tokens · " + elapsed.toFixed(1) + " s · " +
           speed + " tok/s" + (stopped ? " · 已手动停止" : "");
-        bubble.parentElement.appendChild(meta);
+        view.wrap.appendChild(meta);
       } else if (stopped) {
-        bubble.parentElement.remove();
+        view.wrap.remove();
         messages.pop(); // 用户消息也撤回，保持历史一致
       }
       setGenerating(false);
+      describeModelStatus();
       scrollBottom();
       input.focus();
+    });
+  }
+
+  /** 非 2xx 响应：优先拿服务端的 error 文案（如未知模型 / 权重加载失败） */
+  function failWithServerMessage(resp) {
+    return resp.text().then(function (t) {
+      var msg = "";
+      try { msg = (JSON.parse(t) || {}).error || ""; } catch (e) { msg = ""; }
+      throw new Error(msg || ("HTTP " + resp.status));
     });
   }
 

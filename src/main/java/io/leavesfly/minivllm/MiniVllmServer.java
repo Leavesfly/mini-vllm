@@ -1,11 +1,10 @@
 package io.leavesfly.minivllm;
 
 import com.sun.net.httpserver.HttpServer;
-import io.leavesfly.minivllm.core.LLMEngine;
+import io.leavesfly.minivllm.core.ModelHub;
+import io.leavesfly.minivllm.core.ModelRuntime;
 import io.leavesfly.minivllm.family.LoadedModel;
-import io.leavesfly.minivllm.family.ModelRegistry;
 import io.leavesfly.minivllm.family.Precision;
-import io.leavesfly.minivllm.memory.KVCacheManager;
 import io.leavesfly.minivllm.model.ModelConfig;
 import io.leavesfly.minivllm.model.TransformerModel;
 import io.leavesfly.minivllm.tokenizer.BpeTokenizer;
@@ -18,31 +17,39 @@ import io.leavesfly.minivllm.weights.SafetensorsLoader;
 import io.leavesfly.minivllm.api.OpenAiHandler;
 import io.leavesfly.minivllm.api.WebUiHandler;
 
+import java.io.IOException;
 import java.net.InetSocketAddress;
+import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.Executors;
+import java.util.stream.Stream;
 
 /**
  * MiniVllmServer —— 学习型 vLLM 引擎入口。
  *
  * 启动流程：
  *   1. 解析参数（端口 / 权重路径 / 随机初始化 / 并发数 / block 数）
- *   2. 加载模型（--model-dir 经 ModelRegistry 按 model_type 分发到 ModelFamily；
- *      遗留学习路径 --random/--gpt3/--weights 直接构造微模型）
- *   3. 构建 KVCacheManager（PagedAttention 内存池）
- *   4. 构建 LLMEngine 并 start()（独立线程跑 continuous batching）
- *   5. 启动 JDK HttpServer，注册 OpenAI 兼容 API
+ *   2. 注册可选模型到 {@link ModelHub}（默认扫描 models/ 下的每个 HF 模型目录）
+ *   3. 预热默认模型（其余模型首次请求时才加载，含 KV 池 + 引擎线程）
+ *   4. 启动 JDK HttpServer，注册 OpenAI 兼容 API 与 Web 对话页面
+ *
+ * 多模型：每个模型一套独立的 KV 池与引擎，请求体的 model 字段决定路由到哪一套，
+ * Web 页面右上角的下拉框就是在切换这个字段。同时服务 MiniMind3 与 Qwen3-0.6B 建议 -Xmx6g。
  *
  * 用法示例：
- *   默认（加载 Qwen3-0.6B，本地无缓存时自动下载）：
+ *   默认（注册 models/ 下全部模型，预热 minimind-3-agent-512）：
  *     java -jar mini-vllm.jar --port 8080
  *   随机初始化微模型（无需权重，验证流程）：
  *     java -jar mini-vllm.jar --random --port 8080
  *   加载真实权重：
  *     java -jar mini-vllm.jar --weights ./model.safetensors --port 8080
- *   指定本地 Qwen3 模型目录：
- *     java -jar mini-vllm.jar --model-dir ./Qwen3-0.6B --port 8080
+ *   只服务指定模型（可重复传入或逗号分隔多个，首个为默认）：
+ *     java -jar mini-vllm.jar --model-dir ./models/Qwen3-0.6B --port 8080
+ *     java -jar mini-vllm.jar --model-dir ./models/minimind-3-agent-512,./models/Qwen3-0.6B
  *
  * 测试：
  *   curl -X POST http://localhost:8080/v1/chat/completions \
@@ -56,9 +63,15 @@ public final class MiniVllmServer {
     private static final int DEFAULT_PORT = 8080;
     private static final long DEFAULT_SEED = 12345L;
     private static final int DEFAULT_MAX_SEQ_LEN = 2048;
+    /** 默认模型扫描根目录：其下每个含 config.json 的子目录都注册为一个可选模型 */
+    private static final String MODELS_ROOT = "models";
+    /** 首选默认模型：项目自带的 MiniMind3（~29M 参数，CPU 上秒级加载） */
+    private static final String PREFERRED_MODEL = "minimind-3-agent-512";
+    /** models/ 下无任何模型时的下载回退目标 */
     private static final String DEFAULT_MODEL_REPO = "Qwen/Qwen3-0.6B";
+    /** 遗留学习路径（随机微模型 / GPT-3 预设）对外暴露的模型 id */
+    private static final String LEGACY_MODEL_ID = "mini-vllm";
     private static final int DEFAULT_LEARNING_MAX_SEQS = 8;
-    private static final int MIN_NUM_BLOCKS = 1024;
 
 
     // ─── 服务器配置（命令行参数解析结果） ───
@@ -67,7 +80,7 @@ public final class MiniVllmServer {
         int port = DEFAULT_PORT;
         String weightsPath = null;
         String tokenizerDir = null;
-        String modelDir = null;
+        final List<String> modelDirs = new ArrayList<>();
         boolean random = false;
         int maxNumSeqs = -1;
         int numBlocks = -1;
@@ -77,35 +90,33 @@ public final class MiniVllmServer {
         boolean bf16 = false;
         String modelRepo = DEFAULT_MODEL_REPO;
         String mirror = System.getenv("MINIVLLM_MIRROR");
+
+        /** 遗留学习模式：没指定模型目录，而是直接构造微模型 / 读单个权重文件 */
+        boolean isLegacyMode() {
+            return modelDirs.isEmpty() && (random || gpt3 || weightsPath != null);
+        }
     }
 
     public static void main(String[] args) throws Exception {
         ServerConfig config = parseArgs(args);
         printRuntimeDiagnostics();
 
-        // 未显式指定任何模式时，默认加载 Qwen3-0.6B
-        if (config.modelDir == null && !config.random && !config.gpt3 && config.weightsPath == null) {
-            config.modelDir = new ModelDownloader(config.modelRepo, config.mirror).resolve().toString();
+        ModelHub hub = new ModelHub(new ModelHub.Options(
+                config.bf16 ? Precision.BF16 : Precision.F32, config.random,
+                config.maxSeqLen, config.maxNumSeqs, config.numBlocks, config.verbose, DEFAULT_SEED));
+
+        if (config.isLegacyMode()) {
+            hub.adopt(ModelHub.assemble(LEGACY_MODEL_ID, loadLegacyModel(config), hub.options()));
+        } else {
+            for (Path dir : resolveModelDirs(config)) {
+                hub.register(dir.getFileName().toString(), dir);
+            }
+            // 默认模型启动即就绪，其余模型等 Web 页面 / API 首次选中时再加载
+            hub.preload(hub.defaultId());
         }
 
-        // HF 风格模型目录统一走 ModelRegistry（ServiceLoader 插件分发），
-        // 遗留学习路径（随机微模型 / GPT-3 预设）保留直接构造
-        LoadedModel loaded = config.modelDir != null
-                ? new ModelRegistry().load(Path.of(config.modelDir),
-                        config.bf16 ? Precision.BF16 : Precision.F32,
-                        config.random, config.maxSeqLen)
-                : loadLegacyModel(config);
-
-        int maxNumSeqs = resolveMaxNumSeqs(config, loaded);
-        KVCacheManager kvMgr = buildKvPool(loaded.config(), loaded.kvDim(),
-                maxNumSeqs, config.numBlocks);
-        LLMEngine engine = new LLMEngine(loaded.model(), kvMgr, loaded.tokenizer(),
-                maxNumSeqs, loaded.eosTokens(), DEFAULT_SEED);
-        engine.setVerbose(config.verbose);
-        engine.start();
-
-        startHttpServer(engine, loaded, config.port, maxNumSeqs);
-        printBanner(config.port, loaded, maxNumSeqs, config.numBlocks);
+        startHttpServer(hub, config.port);
+        printBanner(config.port, hub);
     }
 
 
@@ -118,7 +129,8 @@ public final class MiniVllmServer {
                 case "--port" -> config.port = Integer.parseInt(args[++i]);
                 case "--weights" -> config.weightsPath = args[++i];
                 case "--tokenizer-dir" -> config.tokenizerDir = args[++i];
-                case "--model-dir" -> config.modelDir = args[++i];
+                // 可重复传入，也可一次传逗号分隔的多个目录；首个为默认模型
+                case "--model-dir", "--model-dirs" -> config.modelDirs.addAll(splitDirs(args[++i]));
                 case "--max-seq-len" -> config.maxSeqLen = Integer.parseInt(args[++i]);
                 case "--random" -> config.random = true;
                 case "--gpt3" -> config.gpt3 = true;
@@ -134,9 +146,51 @@ public final class MiniVllmServer {
         return config;
     }
 
-    /** 优先命令行 --max-seqs，否则用模型家族给出的建议并发数 */
-    private static int resolveMaxNumSeqs(ServerConfig config, LoadedModel loaded) {
-        return config.maxNumSeqs > 0 ? config.maxNumSeqs : loaded.defaultMaxSeqs();
+    private static List<String> splitDirs(String value) {
+        List<String> dirs = new ArrayList<>();
+        for (String part : value.split(",")) {
+            if (!part.isBlank()) {
+                dirs.add(part.trim());
+            }
+        }
+        return dirs;
+    }
+
+
+    // ─── 模型目录解析 ───
+
+    /**
+     * 确定要注册的模型目录列表（首项为默认模型）：
+     *   --model-dir 显式指定 → 扫描项目内 models/ → 自动下载 DEFAULT_MODEL_REPO。
+     */
+    private static List<Path> resolveModelDirs(ServerConfig config) throws Exception {
+        if (!config.modelDirs.isEmpty()) {
+            return config.modelDirs.stream().map(Path::of).toList();
+        }
+        List<Path> scanned = scanModelsRoot(Path.of(MODELS_ROOT));
+        if (!scanned.isEmpty()) {
+            System.out.println("扫描到可用模型目录: " + scanned);
+            return scanned;
+        }
+        return List.of(new ModelDownloader(config.modelRepo, config.mirror).resolve());
+    }
+
+    /**
+     * 扫描 models/ 下的 HF 模型目录（以 config.json 存在为凭）。
+     * PREFERRED_MODEL 排在最前做默认模型：它最小、加载最快，适合启动预热。
+     */
+    private static List<Path> scanModelsRoot(Path root) throws IOException {
+        if (!Files.isDirectory(root)) {
+            return List.of();
+        }
+        try (Stream<Path> entries = Files.list(root)) {
+            return entries
+                    .filter(dir -> Files.isRegularFile(dir.resolve("config.json")))
+                    .sorted(Comparator
+                            .comparing((Path dir) -> PREFERRED_MODEL.equals(dir.getFileName().toString()) ? 0 : 1)
+                            .thenComparing(dir -> dir.getFileName().toString()))
+                    .toList();
+        }
     }
 
 
@@ -164,27 +218,14 @@ public final class MiniVllmServer {
     }
 
 
-    // ─── KV 池构建 ───
-
-    private static KVCacheManager buildKvPool(ModelConfig cfg, int kvDim, int maxNumSeqs, int numBlocks) {
-        if (numBlocks < 0) {
-            int blocksPerSeq = (cfg.maxSeqLen() + cfg.blockSize() - 1) / cfg.blockSize();
-            numBlocks = Math.max(MIN_NUM_BLOCKS, maxNumSeqs * cfg.nLayer() * blocksPerSeq);
-        }
-        KVCacheManager kvMgr = new KVCacheManager(numBlocks, cfg.blockSize(), kvDim);
-        long kvBytes = (long) numBlocks * cfg.blockSize() * kvDim * 2 * 4;
-        System.out.printf("KV 池: %d blocks × blockSize=%d × kvDim=%d（满载约 %.1f GB）%n",
-                numBlocks, cfg.blockSize(), kvDim, kvBytes / 1e9);
-        return kvMgr;
-    }
-
-
     // ─── HTTP 服务 ───
 
-    private static void startHttpServer(LLMEngine engine, LoadedModel loaded, int port,
-                                        int maxNumSeqs) throws Exception {
+    private static void startHttpServer(ModelHub hub, int port) throws Exception {
+        // 流式请求会阻塞 handler 线程，线程池按默认模型的并发上限放大
+        ModelRuntime primary = hub.runtimeIfLoaded(hub.defaultId());
+        int maxNumSeqs = primary != null ? primary.maxNumSeqs() : DEFAULT_LEARNING_MAX_SEQS;
         HttpServer server = HttpServer.create(new InetSocketAddress(port), 0);
-        server.createContext("/v1", new OpenAiHandler(engine, "mini-vllm", loaded.chatTemplate()));
+        server.createContext("/v1", new OpenAiHandler(hub));
         server.createContext("/", new WebUiHandler());
         server.setExecutor(Executors.newFixedThreadPool(Math.max(16, maxNumSeqs * 4)));
         server.start();
@@ -203,20 +244,33 @@ public final class MiniVllmServer {
         }
     }
 
-    private static void printBanner(int port, LoadedModel loaded, int maxNumSeqs, int numBlocks) {
+    private static void printBanner(int port, ModelHub hub) {
         System.out.println("==================================================");
         System.out.println("  mini-vllm 学习型引擎已启动");
         System.out.println("  地址: http://localhost:" + port);
-        System.out.println("  页面: http://localhost:" + port + "/  (对话演示)");
-        System.out.println("  端点: POST /v1/chat/completions");
+        System.out.println("  页面: http://localhost:" + port + "/  (对话演示，可在右上角切换模型)");
+        System.out.println("  端点: POST /v1/chat/completions  (model 字段选模型)");
         System.out.println("        GET  /v1/models");
-        System.out.println("  配置: " + loaded.config());
-        System.out.println("  参数量: " + loaded.model().numParameters());
-        System.out.println("  并发: maxSeqs=" + maxNumSeqs + ", blocks=" + numBlocks);
+        System.out.println("  模型: (* 为默认)");
+        for (String id : hub.ids()) {
+            System.out.println("    " + (id.equals(hub.defaultId()) ? "*" : " ") + " "
+                    + id + " — " + describe(hub.runtimeIfLoaded(id)));
+        }
         System.out.println("==================================================");
         System.out.println("测试命令:");
         System.out.println("  curl -X POST http://localhost:" + port + "/v1/chat/completions \\");
         System.out.println("       -H 'Content-Type: application/json' \\");
-        System.out.println("       -d '{\"model\":\"mini-vllm\",\"messages\":[{\"role\":\"user\",\"content\":\"Hello\"}],\"stream\":true}'");
+        System.out.println("       -d '{\"model\":\"" + hub.defaultId()
+                + "\",\"messages\":[{\"role\":\"user\",\"content\":\"Hello\"}],\"stream\":true}'");
+    }
+
+    /** 已加载模型报告规模与并发，未加载模型则说明懒加载时机 */
+    private static String describe(ModelRuntime runtime) {
+        if (runtime == null) {
+            return "待加载（首次选中时载入）";
+        }
+        return "已就绪, 参数量 " + runtime.loaded().model().numParameters()
+                + ", maxSeqs=" + runtime.maxNumSeqs() + ", blocks=" + runtime.numBlocks()
+                + ", " + runtime.loaded().config();
     }
 }

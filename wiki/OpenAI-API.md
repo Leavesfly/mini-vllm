@@ -10,25 +10,37 @@
 |---|---|---|
 | POST | `/v1/chat/completions` | 对话补全（支持流式/非流式） |
 | POST | `/v1/completions` | 文本补全（复用同一逻辑） |
-| GET | `/v1/models` | 返回模型列表 |
+| GET | `/v1/models` | 返回模型列表（额外附 `loaded` / `default`，供页面标注待加载模型） |
 | GET | `/`、`/index.html` | 内置 Web 对话页（[WebUiHandler](../src/main/java/io/leavesfly/minivllm/api/WebUiHandler.java)） |
 
 服务由 [MiniVllmServer](../src/main/java/io/leavesfly/minivllm/MiniVllmServer.java) 用 `com.sun.net.httpserver.HttpServer` 启动，线程池大小为 `max(16, maxSeqs*4)`（流式请求会阻塞 handler 线程，需足够大）：
 
 ```java
 HttpServer server = HttpServer.create(new InetSocketAddress(port), 0);
-server.createContext("/v1", new OpenAiHandler(engine, "mini-vllm"));
+server.createContext("/v1", new OpenAiHandler(hub));   // hub 持有全部可选模型
 server.createContext("/", new WebUiHandler());
 server.setExecutor(Executors.newFixedThreadPool(Math.max(16, maxNumSeqs * 4)));
 ```
+
+## 多模型路由
+
+[ModelHub](../src/main/java/io/leavesfly/minivllm/core/ModelHub.java) 把请求体的 `model` 字段映射到一个 [ModelRuntime](../src/main/java/io/leavesfly/minivllm/core/ModelRuntime.java)（模型权重 + 专属 KV 池 + 引擎线程）：
+
+- 模型 id 取模型目录名（如 `minimind-3-agent-512` / `Qwen3-0.6B`）；缺省、空值或 `mini-vllm` / `default` / `auto` 都路由到默认模型，未注册的 id 返回 400。
+- 默认模型启动时预热，其余模型在首次被请求时同步加载（加载在 hub 上串行，双重检查避免重复加载）。
+- KV 池不能跨模型共享：block 的 `kvDim` 由 GQA 头数 × headDim 决定，布局不兼容。
+- 代价：常驻内存随「用过的模型数」累加（不做换出），同时服务 MiniMind3 与 Qwen3-0.6B 建议 `-Xmx6g`。
+
+引擎、分词器、对话模板都取自被选中的运行时，所以同一个进程里 MiniMind3 的 `open_thinking` 模板与 Qwen3 官方模板各用各的。
 
 ## 请求参数
 
 `handleChatCompletions` 从 JSON body 提取参数：
 
 ```java
+ModelRuntime runtime = hub.get((String) req.get("model"));   // 未注册的 id → 400
 boolean enableThinking = Boolean.TRUE.equals(req.get("enable_thinking"));
-String prompt = extractPrompt(req, enableThinking);
+String prompt = extractPrompt(runtime.chatTemplate(), req, enableThinking);
 boolean stream = Boolean.TRUE.equals(req.get("stream"));
 int maxTokens   = intOr(req.get("max_tokens"), 2048);
 float temperature = (float) doubleOr(req.get("temperature"), 0.8);
@@ -38,6 +50,7 @@ int topK        = intOr(req.get("top_k"), 0);
 
 | 参数 | 默认 | 说明 |
 |---|---|---|
+| `model` | 默认模型 | 选择模型（取 `/v1/models` 的 id），见下文多模型路由 |
 | `messages` | — | 对话数组（有则走 ChatML）；也支持 `prompt` 纯文本字段 |
 | `stream` | false | true 走 SSE 流式 |
 | `max_tokens` | 2048 | 最大生成 token 数 |
@@ -198,6 +211,7 @@ data: [DONE]
 - 启动时一次性读入内存（`getResourceAsStream("/web/index.html").readAllBytes()`），避免每次请求 IO。
 - 仅响应 `GET /` 与 `/index.html`，其余 404。
 - 页面本身通过 fetch 调用 `/v1/chat/completions`（SSE 流式），与 OpenaiHandler 解耦。
+- 页头右侧的模型下拉框由 `/v1/models` 填充：选择存在 localStorage，作为请求的 `model` 字段发出；`loaded=false` 的模型标为「待加载」，首个 token 到达后刷新列表去掉标记。
 
 访问 `http://localhost:8080/` 即可对话。
 
@@ -207,13 +221,13 @@ data: [DONE]
 # 模型列表
 curl -s http://localhost:8080/v1/models
 
-# 非流式
+# 非流式（model 传模型目录名）
 curl -s -X POST http://localhost:8080/v1/chat/completions -H "Content-Type: application/json" \
-  -d '{"model":"mini-vllm","messages":[{"role":"user","content":"你好"}],"max_tokens":64}'
+  -d '{"model":"minimind-3-agent-512","messages":[{"role":"user","content":"你好"}],"max_tokens":64}'
 
-# 流式
+# 流式（切到另一个模型；首次请求会先同步载入权重）
 curl -s -N -X POST http://localhost:8080/v1/chat/completions -H "Content-Type: application/json" \
-  -d '{"model":"mini-vllm","messages":[{"role":"user","content":"Hi"}],"stream":true}'
+  -d '{"model":"Qwen3-0.6B","messages":[{"role":"user","content":"Hi"}],"stream":true}'
 
 # 思考模式
 curl -s -X POST http://localhost:8080/v1/chat/completions -H "Content-Type: application/json" \

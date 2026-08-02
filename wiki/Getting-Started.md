@@ -56,24 +56,28 @@ mvn compile
 
 入口类 [MiniVllmServer](../src/main/java/io/leavesfly/minivllm/MiniVllmServer.java) 支持三种模式，通过命令行参数切换。
 
-### 模式一：默认（加载真实 Qwen3-0.6B）
+### 模式一：默认（扫描 models/ 下全部模型，可在页面切换）
 
 不传任何模型参数即进入 Qwen3 模式。启动流程：
 
-1. `ModelDownloader.resolve()` 按优先级查找模型目录（项目内 `./models/Qwen3-0.6B` → HF 缓存 → mini-vllm 本地缓存 → 在线下载）
-2. 从 `config.json` 解析 `ModelConfig`
-3. `SafetensorsLoader.load()` 读取 BF16 权重并转 F32
-4. `Qwen3Loader.load()` 组装成 `Qwen3Model`（含 shape 与参数量校验）
-5. `BpeTokenizer.fromModelDir()` 加载 byte-level BPE 分词器
-6. 构建 `KVCacheManager` + `LLMEngine`，启动 HTTP 服务
+1. 扫描项目内 `models/`，每个含 `config.json` 的子目录注册为一个可选模型（`minimind-3-agent-512` 优先作为默认模型）；
+   一个都没扫到时才走 `ModelDownloader.resolve()`（项目内 `./models/Qwen3-0.6B` → HF 缓存 → mini-vllm 本地缓存 → 在线下载）
+2. 默认模型立即加载，其余模型在页面 / API 首次选中时才懒加载（见 `ModelHub`）
+3. 从 `config.json` 解析 `ModelConfig`
+4. `SafetensorsLoader.load()` 读取 BF16 权重并转 F32
+5. `Qwen3Loader.load()` 组装成 `Qwen3Model`（含 shape 与参数量校验）
+6. `BpeTokenizer.fromModelDir()` 加载 byte-level BPE 分词器
+7. 每个模型各构建一套 `KVCacheManager` + `LLMEngine`，然后启动 HTTP 服务
 
 ```bash
-# 编译后直接运行（首次会自动下载权重）
+# 编译后直接运行（models/ 为空时会自动下载权重）
 java -cp target/classes io.leavesfly.minivllm.MiniVllmServer --port 8080
 
-# 指定本地模型目录，跳过下载
+# 只服务指定模型（可重复传入或逗号分隔多个，首个为默认模型）
 java -cp target/classes io.leavesfly.minivllm.MiniVllmServer --model-dir ./models/Qwen3-0.6B --port 8080
 ```
+
+> 同时服务多个模型时，权重与 KV 池各自常驻（不做换出），MiniMind3 + Qwen3-0.6B 建议 `-Xmx6g`。
 
 打包成 jar 运行（manifest 已声明 Vector API 模块）：
 
@@ -108,7 +112,7 @@ java -cp target/classes io.leavesfly.minivllm.MiniVllmServer \
 | 参数 | 默认值 | 说明 |
 |---|---|---|
 | `--port` | 8080 | HTTP 服务端口 |
-| `--model-dir` | 无 | 本地 Qwen3 模型目录（含 config.json / model.safetensors / vocab.json / merges.txt / tokenizer_config.json） |
+| `--model-dir` | 扫描 `models/` 下全部模型 | 本地 Qwen3 模型目录（含 config.json / model.safetensors / vocab.json / merges.txt / tokenizer_config.json）；可重复传入或逗号分隔多个，首个为默认模型 |
 | `--model-repo` | `Qwen/Qwen3-0.6B` | 自动下载的模型仓库名 |
 | `--mirror` | `auto` | 下载源：`auto`（ModelScope 优先，HF 兜底）/ `hf` / `modelscope`；也可用环境变量 `MINIVLLM_MIRROR` |
 | `--weights` | 无 | 学习模式 GPT 微模型的 safetensors 权重路径 |

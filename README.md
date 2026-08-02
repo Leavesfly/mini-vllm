@@ -1,23 +1,23 @@
 # mini-vllm
 
-> 用纯 Java（零外部依赖）从零实现的学习型 vLLM 引擎：PagedAttention + Continuous Batching + CPU Transformer 推理，默认加载真实 Qwen3-0.6B 权重，可对话、可阅读、可改造。
+> 用纯 Java（零外部依赖）从零实现的学习型 vLLM 引擎：PagedAttention + Continuous Batching + CPU Transformer 推理，默认加载真实 MiniMind3 权重，可对话、可阅读、可改造。
 
 ## 项目简介
 
 mini-vllm 是一个**学习型项目**，用 Java + Maven（仅 JDK 标准库，无任何第三方业务依赖）重新实现 vLLM 的核心机制。它不是生产级推理引擎，而是一座"可运行、可阅读、可改造"的教学实验室——让你通过代码而非论文，真正理解 vLLM 为什么快、为什么省显存。
 
-默认模式下，它会自动下载并加载真实的 **Qwen3-0.6B** 模型（BF16 safetensors 权重 + byte-level BPE 分词器 + ChatML 模板），在纯 CPU 上完成可对话的推理；同时也保留随机初始化的 GPT-2/GPT-3 微模型模式，用于无权重快速验证全流程。
+默认模式下，它会加载项目内 `models/minimind-3-agent-512` 的 **MiniMind3** 模型（约 29M 参数，Qwen3 架构，F16 safetensors 权重 + byte-level BPE 分词器 + ChatML 模板），在纯 CPU 上秒级启动完成可对话的推理；也支持切换到 **Qwen3-0.6B** 等更大的 HF 模型目录，并保留随机初始化的 GPT-2/GPT-3 微模型模式，用于无权重快速验证全流程。
 
 ## 核心特性
 
-- **真实模型推理**：完整实现 Qwen3 架构（RMSNorm、RoPE、GQA、SwiGLU、QK-Norm），加载 Qwen3-0.6B 真实权重，与 HuggingFace 参考输出数值对齐
+- **真实模型推理**：完整实现 Qwen3 架构（RMSNorm、RoPE、GQA、SwiGLU、QK-Norm），可加载 MiniMind3 / Qwen3-0.6B 真实权重，与 HuggingFace 参考输出数值对齐
 - **PagedAttention**：`BlockPool` + `BlockTable` 按需分页分配 KV cache，含引用计数与前缀共享接口
 - **Continuous Batching**：`LLMEngine` 的 admit → decode → sweep 三段循环，请求随时进出，KV 显存不足时回滚等待
 - **双模型架构**：除 Qwen3 外，内置 GPT-2/GPT-3 学习微模型（含 GPT-3 交替稠密/局部带状稀疏注意力、标准规模预设）
-- **BPE 分词器**：纯 Java 实现 byte-level BPE（vocab.json + merges.txt），ChatML 对话模板，增量 UTF-8 解码避免流式乱码
-- **权重加载**：纯 Java 解析 safetensors 二进制（含 BF16 解码）；模型自动下载（ModelScope 优先、HF 兜底，断点续传 + 原子改名）
+- **BPE 分词器**：纯 Java 实现 byte-level BPE（vocab.json + merges.txt 或单文件 tokenizer.json），pre-token 正则按模型声明自适应，ChatML 对话模板，增量 UTF-8 解码避免流式乱码
+- **权重加载**：纯 Java 解析 safetensors 二进制（含 BF16 / F16 解码）；模型自动下载（ModelScope 优先、HF 兜底，断点续传 + 原子改名）
 - **OpenAI 兼容 API**：JDK HttpServer 实现 `/v1/chat/completions`（SSE 流式）、`/v1/completions`、`/v1/models`
-- **内置 Web 对话页**：零前端依赖的单页应用，开箱即用
+- **内置 Web 对话页**：零前端依赖的单页应用，可在页头切换模型，开箱即用
 - **SIMD 加速**：`DotKernel` 基于 JDK Vector API（incubator），缺失时自动回退标量实现
 - **随机初始化兜底**：无权重文件也能启动跑通全流程
 
@@ -28,7 +28,8 @@ mini-vllm 是一个**学习型项目**，用 Java + Maven（仅 JDK 标准库，
 | 语言 | Java 17（`jdk.incubator.vector` 可选加速） |
 | 构建 | Maven（零业务依赖，仅 JUnit 5 用于测试） |
 | HTTP | JDK 内置 `com.sun.net.httpserver.HttpServer` |
-| 默认模型 | Qwen3-0.6B（28 层 / hidden 1024 / 16 Q 头 + 8 KV 头 / headDim 128 / vocab 151936） |
+| 默认模型 | MiniMind3 agent-512（8 层 / hidden 512 / 8 Q 头 + 2 KV 头 / headDim 64 / vocab 6400，约 29M 参数） |
+| 可选模型 | Qwen3-0.6B（28 层 / hidden 1024 / 16 Q 头 + 8 KV 头 / headDim 128 / vocab 151936） |
 | 学习微模型 | vocab=256, dModel=64, nHead=4, nLayer=2（GPT-2 风格，可切 GPT-3 nano） |
 
 ## 架构总览
@@ -39,7 +40,7 @@ mini-vllm 是一个**学习型项目**，用 Java + Maven（仅 JDK 标准库，
 │  OpenAiHandler · SseWriter · WebUiHandler                 │  OpenAI 兼容 HTTP + SSE 流式 + Web 对话页
 ├──────────────────────────────────────────────────────────┤
 │  Core 层 (core)                                           │
-│  LLMEngine · Scheduler · Sequence                         │  continuous batching 调度
+│  LLMEngine · Scheduler · Sequence · ModelHub               │  continuous batching 调度 + 多模型路由
 ├──────────────────────────────────────────────────────────┤
 │  Model 层 (model)                                         │
 │  Qwen3Model/Block/Attention · TransformerModel · RoPE     │  Qwen3 与 GPT-2/3 两套前向
@@ -70,15 +71,20 @@ mvn compile
 
 > 零外部依赖，无需下载任何第三方库，编译通常在 1 秒内完成。
 
-### 启动（默认：Qwen3-0.6B）
+### 启动（默认：扫描 models/ 下全部模型）
 
-不传任何参数即默认加载 Qwen3-0.6B：优先复用本地缓存，缺失时自动下载（约 1.5GB）：
+不传任何参数时，`models/` 下每个含 `config.json` 的子目录都会注册为一个可选模型，
+其中 `minimind-3-agent-512`（约 55MB 权重，秒级加载）作为默认模型启动时就预热，
+其余模型（如 `Qwen3-0.6B`）在 Web 页面 / API 首次选中时才懒加载：
 
 ```bash
 java -cp target/classes io.leavesfly.minivllm.MiniVllmServer --port 8080
 ```
 
-指定本地模型目录（跳过下载）：
+> `models/` 已 gitignore，不随仓库分发。目录下无任何模型时会回退到自动下载 Qwen3-0.6B （约 1.5GB）。
+> 同时服务 MiniMind3 与 Qwen3-0.6B 时（两者各持一套权重与 KV 池）建议加 `-Xmx6g`。
+
+只服务指定模型（可重复传入或逗号分隔多个，首个为默认模型）：
 
 ```bash
 java -cp target/classes io.leavesfly.minivllm.MiniVllmServer --model-dir ./models/Qwen3-0.6B --port 8080
@@ -106,22 +112,24 @@ java -cp target/classes io.leavesfly.minivllm.MiniVllmServer --gpt3 --port 8080
 ### Web 对话页面
 
 启动后浏览器访问 `http://localhost:8080/`，内置单页对话应用，支持流式输出与多轮对话。
+页头右侧的下拉框可在已注册模型间切换（如 `minimind-3-agent-512` / `Qwen3-0.6B`）：
+选择会记在 localStorage、作为请求的 `model` 字段发出，标有「待加载」的模型在首次对话时才载入权重（首个 token 会明显变慢）。
 
 ### 测试 API
 
 ```bash
-# 查看模型列表
+# 查看模型列表（每项附带 loaded / default 供页面标注）
 curl -s http://localhost:8080/v1/models
 
-# 非流式补全
+# 非流式补全（model 传模型目录名；缺省或传 "mini-vllm" 则路由到默认模型）
 curl -s -X POST http://localhost:8080/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -d '{"model":"mini-vllm","messages":[{"role":"user","content":"你好"}],"max_tokens":64,"stream":false}'
+  -d '{"model":"minimind-3-agent-512","messages":[{"role":"user","content":"你好"}],"max_tokens":64,"stream":false}'
 
 # 流式补全（SSE）
 curl -s -N -X POST http://localhost:8080/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -d '{"model":"mini-vllm","messages":[{"role":"user","content":"Hi"}],"max_tokens":32,"stream":true}'
+  -d '{"model":"Qwen3-0.6B","messages":[{"role":"user","content":"Hi"}],"max_tokens":32,"stream":true}'
 
 # 开启 Qwen3 思考模式（输出 <think>...</think> 推理过程）
 curl -s -X POST http://localhost:8080/v1/chat/completions \
@@ -129,7 +137,7 @@ curl -s -X POST http://localhost:8080/v1/chat/completions \
   -d '{"model":"mini-vllm","messages":[{"role":"user","content":"9.11 和 9.9 哪个大"}],"enable_thinking":true}'
 ```
 
-支持的请求参数：`messages`、`stream`、`max_tokens`（默认 2048）、`temperature`（默认 0.8）、`top_p`（默认 0.9）、`top_k`、`enable_thinking`（默认 false）。
+支持的请求参数：`model`（默认模型）、`messages`、`stream`、`max_tokens`（默认 2048）、`temperature`（默认 0.8）、`top_p`（默认 0.9）、`top_k`、`enable_thinking`（默认 false）。
 
 ### 使用 OpenAI SDK 连接
 
@@ -151,8 +159,8 @@ print(resp.choices[0].message.content)
 | 参数 | 默认值 | 说明 |
 |---|---|---|
 | `--port` | 8080 | HTTP 服务端口 |
-| `--model-dir` | 无 | 本地 Qwen3 模型目录（含 config.json / model.safetensors / 分词器文件） |
-| `--model-repo` | Qwen/Qwen3-0.6B | 自动下载的模型仓库名 |
+| `--model-dir` | 扫描 `models/` 下全部模型 | 本地 Qwen3 系模型目录（含 config.json / model.safetensors / 分词器文件）；可重复传入或逗号分隔多个，首个为默认模型 |
+| `--model-repo` | Qwen/Qwen3-0.6B | `models/` 下无模型时，自动下载的模型仓库名 |
 | `--mirror` | auto（env `MINIVLLM_MIRROR`） | 下载源：`auto` / `hf` / `modelscope` |
 | `--weights` | 无 | 学习模式 GPT 微模型的 safetensors 权重路径 |
 | `--tokenizer-dir` | 无 | 学习模式使用 BPE 分词器的模型目录（缺省用 ByteTokenizer） |
@@ -165,7 +173,7 @@ print(resp.choices[0].message.content)
 
 ## 模型下载与缓存
 
-`ModelDownloader` 按以下顺序解析模型目录，命中即返回：
+不传 `--model-dir` 时，优先扫描项目内 `models/` 下的模型目录（以 `config.json` 存在为凭）；一个都没扫到才交由 `ModelDownloader` 按以下顺序解析 `--model-repo`，命中即返回：
 
 1. 项目内 `./models/<name>`（如 `./models/Qwen3-0.6B`，最优先）
 2. HuggingFace 缓存 `~/.cache/huggingface/hub`
@@ -184,7 +192,7 @@ src/main/java/io/leavesfly/minivllm/
 ├── memory/         # PagedAttention KV cache 内存管理
 ├── math/           # 纯 Java 张量算子（含 Vector API SIMD 点积）
 ├── tokenizer/      # byte-level BPE 分词器、ChatML 模板、字节/字符分词器
-├── weights/        # safetensors 解析（含 BF16）、模型下载与组装
+├── weights/        # safetensors 解析（含 BF16 / F16）、模型下载与组装
 ├── json/           # 手写 JSON 编解码
 ├── tools/          # Benchmark 压测工具
 └── MiniVllmServer.java  # 入口
@@ -192,7 +200,8 @@ src/main/java/io/leavesfly/minivllm/
 src/main/resources/web/    # 内置 Web 对话单页
 src/test/                  # JUnit 5 单测 + HF 数值对齐测试
 tools/                     # HF 参考数据导出脚本（Python，供对齐测试用）
-models/Qwen3-0.6B/         # 默认模型本地缓存（已 gitignore）
+models/minimind-3-agent-512/   # 默认模型（已 gitignore）
+models/Qwen3-0.6B/             # 可选模型本地缓存（已 gitignore）
 ```
 
 ## 与真实 vLLM 的对应
@@ -205,6 +214,7 @@ models/Qwen3-0.6B/         # 默认模型本地缓存（已 gitignore）
 | `LLMEngine.step` | scheduler + worker loop | 单线程，vLLM 多 GPU 并行 |
 | `Scheduler` | vLLM Scheduler | 一致（waiting/running 队列），学习版不做 preemption |
 | `OpenAiHandler` | OpenAI API server | 用 JDK HttpServer |
+| `ModelHub` | 多模型部署与模型路由 | 按 `model` 字段路由，首次选中时懒加载，不做模型换出 |
 
 ## 测试与数值对齐
 

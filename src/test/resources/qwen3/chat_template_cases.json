@@ -1,0 +1,9 @@
+{
+ "mini/single/think": "<|im_start|>user\n你好<|im_end|>\n<|im_start|>assistant\n<think>\n",
+ "mini/single/nothink": "<|im_start|>user\n你好<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+ "mini/multi/think": "<|im_start|>user\n问1<|im_end|>\n<|im_start|>assistant\n<think>\n思考A\n</think>\n\n答案A<|im_end|>\n<|im_start|>user\n问2<|im_end|>\n<|im_start|>assistant\n<think>\n",
+ "mini/plainhist/think": "<|im_start|>user\n问1<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n纯答案<|im_end|>\n<|im_start|>user\n问2<|im_end|>\n<|im_start|>assistant\n<think>\n",
+ "qwen/single/think": "<|im_start|>user\n你好<|im_end|>\n<|im_start|>assistant\n",
+ "qwen/single/nothink": "<|im_start|>user\n你好<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+ "qwen/multi/think": "<|im_start|>user\n问1<|im_end|>\n<|im_start|>assistant\n答案A<|im_end|>\n<|im_start|>user\n问2<|im_end|>\n<|im_start|>assistant\n"
+}

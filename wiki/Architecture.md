@@ -10,7 +10,7 @@
 │  OpenAiHandler · SseWriter · WebUiHandler                 │  OpenAI 兼容 HTTP + SSE 流式 + Web 对话页
 ├──────────────────────────────────────────────────────────┤
 │  Core 层 (core)                                           │
-│  LLMEngine · Scheduler · Sequence                         │  Continuous Batching 调度
+│  LLMEngine · Scheduler · Sequence · ModelHub               │  Continuous Batching 调度 + 多模型路由
 ├──────────────────────────────────────────────────────────┤
 │  Model 层 (model)                                         │
 │  Qwen3Model/Block/Attention · TransformerModel · RoPE     │  Qwen3 与 GPT-2/3 两套前向
@@ -36,7 +36,7 @@
 |---|---|---|
 | （根） | `MiniVllmServer` | 入口：解析参数、装配模型、启动引擎与 HTTP |
 | `api` | `OpenAiHandler`、`SseWriter`、`WebUiHandler` | OpenAI 兼容端点、SSE 流式、静态页 |
-| `core` | `LLMEngine`、`Scheduler`、`Sequence` | Continuous Batching 调度与请求状态机 |
+| `core` | `LLMEngine`、`Scheduler`、`Sequence`、`ModelHub`/`ModelRuntime` | Continuous Batching 调度与请求状态机；多模型注册与按 `model` 字段路由（首次选中时懒加载） |
 | `model` | `LlmModel`、`Qwen3Model`、`TransformerModel`、`Qwen3Block/Attention`、`SwiGluFfn`、`RotaryEmbedding`、`Linear`、`Embedding`、`ModelConfig` | 模型前向计算 |
 | `memory` | `KVCacheManager`、`BlockPool`、`BlockTable` | PagedAttention KV cache 内存管理 |
 | `math` | `Matmul`、`DotKernel`、`RmsNorm`、`LayerNorm`、`Softmax`、`Silu`、`Gelu`、`Sampler`、`Tensor` | 纯 Java 数值算子 |
