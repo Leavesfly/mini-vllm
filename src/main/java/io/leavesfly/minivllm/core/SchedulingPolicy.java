@@ -8,9 +8,9 @@ package io.leavesfly.minivllm.core;
  *    从 waiting 队列移除；显存不足时候选留在队列，等 running 释放后再试。
  * 2. 默认 {@link FifoPolicy} 先来先服务（与 vLLM 默认一致）。
  * 3. 后续扩展点（本版未实现）：
- *    - 优先级调度：按请求优先级/预估长度重排 waiting；
- *    - preemption：显存吃紧时换出低优先级 running 序列（vLLM 的 swap/recompute），
- *      而不是像现在这样直接 ABORTED。
+ *    - 优先级调度：按请求优先级/预估长度重排 waiting。
+ *    注：preemption 已由引擎实现（recompute 版，见 LLMEngine.collectDecodeBatch），
+ *    被抢占序列退回 waiting 队首，本策略无需感知。
  */
 public interface SchedulingPolicy {
 

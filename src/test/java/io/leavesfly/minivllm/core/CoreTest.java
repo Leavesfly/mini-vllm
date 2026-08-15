@@ -5,6 +5,7 @@ import org.junit.jupiter.api.Test;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.function.Consumer;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -148,5 +149,51 @@ class CoreTest {
         for (Thread t : threads) t.start();
         for (Thread t : threads) t.join();
         assertEquals(100, scheduler.waitingCount());
+    }
+
+    // ========== 采样 penalty 测试（阶段五） ==========
+
+    /** greedy 参数基础：temperature=0 → argmax，便于确定性验证 penalty 对 logits 的变换 */
+    private static SamplingParams penaltyParams(float rep, float freq, Map<Integer, Float> bias) {
+        return new SamplingParams(10, 0f, 0, 1f, rep, freq, 0f, bias);
+    }
+
+    @Test
+    void logitBiasShiftsGreedyChoice() {
+        DefaultSamplingStrategy strategy = new DefaultSamplingStrategy(1L);
+        float[] logits = {1f, 2f, 0f};
+        // 无偏置时 greedy 选 token 1
+        assertEquals(1, strategy.sample(logits.clone(), penaltyParams(1f, 0f, null),
+                new int[0], List.of()));
+        // 对 token 2 加大正偏置后翻转 argmax
+        assertEquals(2, strategy.sample(logits.clone(), penaltyParams(1f, 0f, Map.of(2, 100f)),
+                new int[0], List.of()));
+    }
+
+    @Test
+    void repetitionPenaltySuppressesHistoryToken() {
+        DefaultSamplingStrategy strategy = new DefaultSamplingStrategy(1L);
+        float[] logits = {1f, 2f, 0f};
+        // token 1 在 prompt 中出现，r=3 → logit 2/3≈0.67 < 1 → argmax 转为 token 0
+        assertEquals(0, strategy.sample(logits.clone(), penaltyParams(3f, 0f, null),
+                new int[]{1}, List.of()));
+    }
+
+    @Test
+    void frequencyPenaltyCountsOutputOccurrences() {
+        DefaultSamplingStrategy strategy = new DefaultSamplingStrategy(1L);
+        float[] logits = {1f, 2f, 0f};
+        // token 1 已生成两次，freq=2 → 2 - 2×2 = -2 → argmax 转为 token 0
+        assertEquals(0, strategy.sample(logits.clone(), penaltyParams(1f, 2f, null),
+                new int[0], List.of(1, 1)));
+    }
+
+    @Test
+    void cancelledSequenceReportsFinished() {
+        Sequence seq = newSeq(0, new int[]{1}, 100, NO_EOS, 2, null);
+        assertFalse(seq.isFinished());
+        seq.cancel();
+        assertTrue(seq.cancelled());
+        assertTrue(seq.isFinished(), "取消后 isFinished 应立即为 true（等待方不阻塞）");
     }
 }

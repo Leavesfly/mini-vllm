@@ -15,6 +15,9 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
+import java.util.Map;
+import java.util.SortedSet;
+import java.util.TreeSet;
 import java.util.stream.Stream;
 
 /**
@@ -28,12 +31,22 @@ import java.util.stream.Stream;
  * 2. 下载可靠性：.part 临时文件 + 完成后原子改名（避免半成品被当作完整文件），
  *    Range 请求头实现断点续传（1.5GB 权重中断后不必重下）。
  * 3. HF 的 resolve URL 会 302 跳转到 CDN，HttpClient 需开启 followRedirects。
+ * 4. 权重文件两种形态自动识别：单文件 model.safetensors，或多分片
+ *    （model.safetensors.index.json + 若干 model-0000X-of-N.safetensors，如 Qwen3-4B）。
+ *    探测方式是下载索引文件：所有镜像 404 即为单文件模型。
+ * 5. 词表同样两种形态：tokenizer.json 单文件（Llama 系）或 vocab.json + merges.txt
+ *    （Qwen 系）；generation_config.json 可选（EOS 权威来源），有则下载。
  */
 public final class ModelDownloader {
 
-    /** Qwen3 模式运行所需的最小文件集 */
+    /** 运行所需的最小文件集（权重与词表除外：分别由 downloadWeights / downloadVocab 按形态处理） */
     private static final List<String> REQUIRED_FILES = List.of(
-            "config.json", "model.safetensors", "vocab.json", "merges.txt", "tokenizer_config.json");
+            "config.json", "tokenizer_config.json");
+
+    private static final String WEIGHTS_SINGLE = "model.safetensors";
+    private static final String WEIGHTS_INDEX = "model.safetensors.index.json";
+    /** 单文件词表（新版导出；Llama 系仅有它），缺省时回退 vocab.json + merges.txt（Qwen 系） */
+    private static final String TOKENIZER_JSON = "tokenizer.json";
 
     private static final String HF_URL = "https://huggingface.co/%s/resolve/main/%s";
     private static final String MS_URL = "https://modelscope.cn/models/%s/resolve/master/%s";
@@ -103,22 +116,66 @@ public final class ModelDownloader {
         }
     }
 
-    /** 目录中必需文件齐全且非空 */
+    /** 目录中必需文件齐全且非空（含权重完整性：单文件或索引+全部分片） */
     private static boolean isComplete(Path dir) {
         if (!Files.isDirectory(dir)) {
             return false;
         }
         for (String f : REQUIRED_FILES) {
-            try {
-                Path p = dir.resolve(f);
-                if (!Files.isRegularFile(p) || Files.size(p) == 0) {
-                    return false;
-                }
-            } catch (IOException e) {
+            if (!nonEmptyFile(dir.resolve(f))) {
                 return false;
             }
         }
-        return true;
+        return vocabComplete(dir) && weightsComplete(dir);
+    }
+
+    /** 词表完整性：tokenizer.json 单文件，或 vocab.json + merges.txt 组合 */
+    private static boolean vocabComplete(Path dir) {
+        return nonEmptyFile(dir.resolve(TOKENIZER_JSON))
+                || (nonEmptyFile(dir.resolve("vocab.json")) && nonEmptyFile(dir.resolve("merges.txt")));
+    }
+
+    private static boolean nonEmptyFile(Path p) {
+        try {
+            return Files.isRegularFile(p) && Files.size(p) > 0;
+        } catch (IOException e) {
+            return false;
+        }
+    }
+
+    /** 权重完整性：单文件存在，或索引存在且其引用的全部分片都存在 */
+    private static boolean weightsComplete(Path dir) {
+        if (nonEmptyFile(dir.resolve(WEIGHTS_SINGLE))) {
+            return true;
+        }
+        Path index = dir.resolve(WEIGHTS_INDEX);
+        if (!nonEmptyFile(index)) {
+            return false;
+        }
+        try {
+            for (String shard : shardNames(index)) {
+                if (!nonEmptyFile(dir.resolve(shard))) {
+                    return false;
+                }
+            }
+            return true;
+        } catch (IOException | RuntimeException e) {
+            return false; // 索引损坏视为不完整，走重新下载分片的恢复路径
+        }
+    }
+
+    /** 从分片索引解析引用的分片文件名（去重排序） */
+    private static List<String> shardNames(Path index) throws IOException {
+        Object wm = io.leavesfly.minivllm.json.SimpleJson
+                .parseObject(Files.readString(index)).get("weight_map");
+        if (!(wm instanceof Map)) {
+            throw new IOException(WEIGHTS_INDEX + " 缺少 weight_map: " + index);
+        }
+        SortedSet<String> names = new TreeSet<>();
+        for (Object v : ((Map<?, ?>) wm).values()) {
+            names.add(String.valueOf(v));
+        }
+        return List.copyOf(names);
     }
 
     private void downloadAll(Path dir) throws IOException, InterruptedException {
@@ -126,12 +183,80 @@ public final class ModelDownloader {
         System.out.println("模型未就绪，开始下载 " + repo + " → " + dir);
         for (String file : REQUIRED_FILES) {
             Path dest = dir.resolve(file);
-            if (Files.isRegularFile(dest) && Files.size(dest) > 0) {
+            if (nonEmptyFile(dest)) {
                 continue;
             }
             downloadWithFallback(file, dest);
         }
+        downloadVocab(dir);
+        downloadWeights(dir);
+        // generation_config.json 可选（EOS 权威来源）：有则下载，404 忽略
+        downloadIfPresent("generation_config.json", dir);
         System.out.println("模型下载完成: " + dir);
+    }
+
+    /** 词表下载：优先 tokenizer.json 单文件（Llama 系），404 则回退 vocab.json + merges.txt */
+    private void downloadVocab(Path dir) throws IOException, InterruptedException {
+        if (vocabComplete(dir)) {
+            return;
+        }
+        if (downloadIfPresent(TOKENIZER_JSON, dir)) {
+            return;
+        }
+        downloadWithFallback("vocab.json", dir.resolve("vocab.json"));
+        downloadWithFallback("merges.txt", dir.resolve("merges.txt"));
+    }
+
+    /** 权重下载：已存在单文件直接用；否则探测分片索引，按索引逐个下载分片 */
+    private void downloadWeights(Path dir) throws IOException, InterruptedException {
+        if (nonEmptyFile(dir.resolve(WEIGHTS_SINGLE))) {
+            return;
+        }
+        if (downloadIfPresent(WEIGHTS_INDEX, dir)) {
+            for (String shard : shardNames(dir.resolve(WEIGHTS_INDEX))) {
+                Path dest = dir.resolve(shard);
+                if (nonEmptyFile(dest)) {
+                    continue;
+                }
+                downloadWithFallback(shard, dest);
+            }
+        } else {
+            downloadWithFallback(WEIGHTS_SINGLE, dir.resolve(WEIGHTS_SINGLE));
+        }
+    }
+
+    /**
+     * 探测并下载可选文件：任一镜像成功返回 true；全部镜像 404 返回 false（单文件模型、
+     * 无该可选文件的模型），清理探测残留。网络类错误优先于 404 抛出——避免把
+     * 「镜像故障」误判为「文件不存在」，进而发起必然失败的回退下载。
+     */
+    private boolean downloadIfPresent(String file, Path dir) throws IOException, InterruptedException {
+        Path dest = dir.resolve(file);
+        if (nonEmptyFile(dest)) {
+            return true; // 已存在（续传场景）
+        }
+        IOException networkError = null;
+        for (String url : mirrorUrls(file)) {
+            try {
+                downloadFile(url, dest);
+                return true;
+            } catch (IOException e) {
+                if (!isHttp404(e)) {
+                    networkError = e; // 记录后继续尝试下一镜像
+                }
+            }
+        }
+        if (networkError != null) {
+            throw networkError;
+        }
+        Files.deleteIfExists(partFile(dest));   // 清理探测留下的 .part / .part.url 残留
+        Files.deleteIfExists(sourceFile(dest));
+        return false;
+    }
+
+    /** downloadFile 对非 200/206/416 状态抛 "HTTP <status>"，404 即文件不存在 */
+    private static boolean isHttp404(IOException e) {
+        return "HTTP 404".equals(e.getMessage());
     }
 
     /** 按镜像策略生成候选 URL（auto：ModelScope 优先，HF 兜底） */

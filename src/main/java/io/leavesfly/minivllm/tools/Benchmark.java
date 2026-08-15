@@ -45,19 +45,24 @@ public final class Benchmark {
         ModelConfig cfg = ModelConfig.fromConfigJson(SimpleJson.parseObject(
                 Files.readString(modelDir.resolve("config.json"))));
         cfg.maxSeqLen(2048);
-        boolean int8 = Boolean.getBoolean("weights.int8");
-        boolean bf16 = Boolean.getBoolean("weights.bf16") || int8; // int8 从 bf16 量化而来
-        System.out.println("加载权重... (" + (int8 ? "int8 量化" : bf16 ? "bf16 常驻" : "f32 常驻") + ")");
+        boolean int4 = Boolean.getBoolean("weights.int4");
+        boolean int8 = Boolean.getBoolean("weights.int8") || int4; // int4 同样从 bf16 量化而来
+        boolean bf16 = Boolean.getBoolean("weights.bf16") || int8;
+        System.out.println("加载权重... (" + (int4 ? "int4 量化" : int8 ? "int8 量化"
+                : bf16 ? "bf16 常驻" : "f32 常驻") + ")");
         long t0 = System.currentTimeMillis();
         Qwen3Model model;
-        if (int8) {
-            Map<String, short[]> weights = SafetensorsLoader.loadBf16Bits(modelDir.resolve("model.safetensors"));
+        if (int4) {
+            Map<String, short[]> weights = SafetensorsLoader.loadDirBf16Bits(modelDir);
+            model = Qwen3Loader.loadInt4(cfg, weights);
+        } else if (int8) {
+            Map<String, short[]> weights = SafetensorsLoader.loadDirBf16Bits(modelDir);
             model = Qwen3Loader.loadInt8(cfg, weights);
         } else if (bf16) {
-            Map<String, short[]> weights = SafetensorsLoader.loadBf16Bits(modelDir.resolve("model.safetensors"));
+            Map<String, short[]> weights = SafetensorsLoader.loadDirBf16Bits(modelDir);
             model = Qwen3Loader.loadBf16(cfg, weights);
         } else {
-            Map<String, float[]> weights = SafetensorsLoader.load(modelDir.resolve("model.safetensors"));
+            Map<String, float[]> weights = SafetensorsLoader.loadDir(modelDir);
             model = Qwen3Loader.load(cfg, weights);
         }
         System.out.printf("模型加载完成: %d 参数, %.1f s%n",

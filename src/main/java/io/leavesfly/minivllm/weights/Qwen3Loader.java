@@ -19,6 +19,8 @@ import java.util.Set;
 
 import io.leavesfly.minivllm.weights.Quantize.Int8Weight;
 
+import java.nio.ShortBuffer;
+
 /**
  * Qwen3Loader —— 把 HuggingFace Qwen3 权重字典组装成 Qwen3Model。
  *
@@ -182,6 +184,47 @@ public final class Qwen3Loader {
         }
     }
 
+    /**
+     * INT4 量化权重源（从 bf16 量化）：Linear 用 per-group INT4（带宽为 int8 的一半）；
+     * Embedding 仍用 per-row INT8——查表是随机访问而非顺序带宽，INT4 收益小且误差敏感。
+     */
+    private static final class Int4Source extends AbstractWeightSource {
+        private final Map<String, short[]> weights;
+        private final int groupSize;
+
+        Int4Source(Map<String, short[]> weights, int groupSize) {
+            this.weights = weights;
+            this.groupSize = groupSize;
+        }
+
+        @Override
+        public Embedding embedding(String name, int vocabSize, int dModel) {
+            short[] bits = get(name, vocabSize * dModel);
+            Int8Weight q = Quantize.quantizeBf16(bits, vocabSize, dModel);
+            return Embedding.ofInt8(q.data, q.scale, vocabSize, dModel);
+        }
+
+        @Override
+        public Linear linear(String name, int in, int out) {
+            short[] bits = get(name, out * in);
+            Quantize.Int4Weight q = Quantize.quantizeBf16ToInt4(bits, out, in, groupSize);
+            return Linear.ofInt4(q.data, q.scale, groupSize, in, out);
+        }
+
+        @Override
+        public RmsNorm rmsNorm(String name, int dim, float eps) {
+            return new RmsNorm(bf16ToFloatArray(get(name, dim)), eps);
+        }
+
+        @Override
+        public Set<String> allKeys() { return weights.keySet(); }
+
+        private short[] get(String name, int expect) {
+            short[] d = weights.get(name);
+            return requireWeight(name, d, d == null ? 0 : d.length, expect);
+        }
+    }
+
     /** bf16 位数组转 f32（RmsNorm gamma 等小数组共用） */
     private static float[] bf16ToFloatArray(short[] bits) {
         float[] out = new float[bits.length];
@@ -189,6 +232,46 @@ public final class Qwen3Loader {
             out[i] = Bf16.bf16ToFloat(bits[i] & 0xFFFF);
         }
         return out;
+    }
+
+    /**
+     * MMAP 权重源：大矩阵（Embedding/Linear）直接持映射视图不落堆；
+     * RmsNorm gamma 等小张量逐元素读入堆内 f32（每次前向都全量访问，常驻避免反复缺页）。
+     */
+    private static final class MmapWeightSource extends AbstractWeightSource {
+        private final MmapWeights weights;
+
+        MmapWeightSource(MmapWeights weights) {
+            this.weights = weights;
+        }
+
+        @Override
+        public Embedding embedding(String name, int vocabSize, int dModel) {
+            return Embedding.ofMmapBf16(requireView(name, vocabSize * dModel), vocabSize, dModel);
+        }
+
+        @Override
+        public Linear linear(String name, int in, int out) {
+            return Linear.ofMmapBf16(requireView(name, out * in), in, out);
+        }
+
+        @Override
+        public RmsNorm rmsNorm(String name, int dim, float eps) {
+            ShortBuffer v = requireView(name, dim);
+            float[] w = new float[dim];
+            for (int i = 0; i < dim; i++) {
+                w[i] = Bf16.bf16ToFloat(v.get(i) & 0xFFFF);
+            }
+            return new RmsNorm(w, eps);
+        }
+
+        @Override
+        public Set<String> allKeys() { return weights.keys(); }
+
+        private ShortBuffer requireView(String name, int expectLen) {
+            ShortBuffer v = weights.view(name);
+            return requireWeight(name, v, v == null ? 0 : v.capacity(), expectLen);
+        }
     }
 
 
@@ -229,12 +312,44 @@ public final class Qwen3Loader {
         return model;
     }
 
+    /**
+     * 从 bf16 位权重字典构造 INT4 量化版 Qwen3Model（per-group 对称，默认 64 元素/组）。
+     * Linear 权重仅占 int8 的一半内存（约 0.5 字节/参数），decode 带宽再减半；
+     * Embedding 保持 INT8（查表随机访问，对量化误差不敏感）。
+     * 要求各 Linear 的 inFeatures 能整除分组大小（Qwen3 主流维度均满足）。
+     */
+    public static Qwen3Model loadInt4(ModelConfig cfg, Map<String, short[]> weights) {
+        return loadInt4(cfg, weights, Quantize.DEFAULT_INT4_GROUP);
+    }
+
+    /** 指定分组大小的 {@link #loadInt4} */
+    public static Qwen3Model loadInt4(ModelConfig cfg, Map<String, short[]> weights, int groupSize) {
+        Int4Source source = new Int4Source(weights, groupSize);
+        Qwen3Model model = buildModel(cfg, source);
+        validateCompleteness(cfg, source.allKeys(), source.consumed());
+        validateParams(cfg, model);
+        return model;
+    }
+
+    /**
+     * 从 mmap 权重库构造 Qwen3Model：大矩阵以映射视图直读（不落堆，OS 页缓存按需调页），
+     * 数值与 bf16 堆内路径完全一致（同行数据、同一点积内核）。
+     */
+    public static Qwen3Model loadMmap(ModelConfig cfg, MmapWeights weights) {
+        MmapWeightSource source = new MmapWeightSource(weights);
+        Qwen3Model model = buildModel(cfg, source);
+        validateCompleteness(cfg, source.allKeys(), source.consumed());
+        validateParams(cfg, model);
+        return model;
+    }
+
     /** 随机初始化（无权重文件时跑通流程，输出无意义） */
     public static Qwen3Model randomInit(ModelConfig cfg) {
         Random rnd = new Random(42L);
         Embedding wte = new Embedding(ArrayUtil.randNormal(rnd, cfg.vocabSize() * cfg.dModel(), 0.02f),
                 cfg.vocabSize(), cfg.dModel());
-        RotaryEmbedding rope = new RotaryEmbedding(cfg.headDim(), cfg.maxSeqLen(), cfg.ropeTheta());
+        RotaryEmbedding rope = new RotaryEmbedding(cfg.headDim(), cfg.maxSeqLen(), cfg.ropeTheta(),
+                cfg.ropeScaling());
         Qwen3Block[] blocks = new Qwen3Block[cfg.nLayer()];
         for (int i = 0; i < cfg.nLayer(); i++) {
             RmsNorm inputNorm = rmsOnes(cfg.dModel(), cfg.rmsNormEps());
@@ -243,8 +358,8 @@ public final class Qwen3Loader {
             Linear k = Linear.of(ArrayUtil.randNormal(rnd, cfg.kvDim() * cfg.dModel(), 0.02f), cfg.dModel(), cfg.kvDim());
             Linear v = Linear.of(ArrayUtil.randNormal(rnd, cfg.kvDim() * cfg.dModel(), 0.02f), cfg.dModel(), cfg.kvDim());
             Linear o = Linear.of(ArrayUtil.randNormal(rnd, cfg.dModel() * cfg.qDim(), 0.02f), cfg.qDim(), cfg.dModel());
-            RmsNorm qNorm = rmsOnes(cfg.headDim(), cfg.rmsNormEps());
-            RmsNorm kNorm = rmsOnes(cfg.headDim(), cfg.rmsNormEps());
+            RmsNorm qNorm = cfg.qkNorm() ? rmsOnes(cfg.headDim(), cfg.rmsNormEps()) : null;
+            RmsNorm kNorm = cfg.qkNorm() ? rmsOnes(cfg.headDim(), cfg.rmsNormEps()) : null;
             Qwen3Attention attn = new Qwen3Attention(cfg, q, k, v, o, qNorm, kNorm, rope);
             Linear gate = Linear.of(ArrayUtil.randNormal(rnd, cfg.dFfn() * cfg.dModel(), 0.02f), cfg.dModel(), cfg.dFfn());
             Linear up = Linear.of(ArrayUtil.randNormal(rnd, cfg.dFfn() * cfg.dModel(), 0.02f), cfg.dModel(), cfg.dFfn());
@@ -254,13 +369,13 @@ public final class Qwen3Loader {
         return new Qwen3Model(cfg, wte, blocks, rmsOnes(cfg.dModel(), cfg.rmsNormEps()));
     }
 
-    /** 按配置计算期望参数量（tied：lm_head 不重复计） */
+    /** 按配置计算期望参数量（tied：lm_head 不重复计；qk norm 按架构有无计入） */
     public static long expectedParams(ModelConfig cfg) {
         long perLayer = 2L * cfg.dModel()                       // inputNorm + postAttnNorm
                 + (long) cfg.qDim() * cfg.dModel()              // q_proj
                 + 2L * cfg.kvDim() * cfg.dModel()               // k/v_proj
                 + (long) cfg.dModel() * cfg.qDim()              // o_proj
-                + 2L * cfg.headDim()                          // q/k norm
+                + (cfg.qkNorm() ? 2L * cfg.headDim() : 0L)      // q/k norm（Qwen3 有，Llama 无）
                 + 3L * cfg.dFfn() * cfg.dModel();                 // gate/up/down
         return (long) cfg.vocabSize() * cfg.dModel()              // embed_tokens
                 + perLayer * cfg.nLayer()
@@ -270,10 +385,15 @@ public final class Qwen3Loader {
 
     // ─── 统一骨架构建 ───
 
-    /** 使用 WeightSource 构建模型骨架（消除 load/loadBf16/loadInt8 的重复代码） */
+    /**
+     * 使用 WeightSource 构建模型骨架（消除 load/loadBf16/loadInt8/loadInt4 的重复代码）。
+     * 同名骨架也覆盖 Llama 系（权重名一致）：qk_norm 有无由 cfg.qkNorm() 决定，
+     * RoPE 频率缩放由 cfg.ropeScaling() 决定——家族差异收敛在 ModelConfig。
+     */
     private static Qwen3Model buildModel(ModelConfig cfg, WeightSource src) {
         Embedding wte = src.embedding("model.embed_tokens.weight", cfg.vocabSize(), cfg.dModel());
-        RotaryEmbedding rope = new RotaryEmbedding(cfg.headDim(), cfg.maxSeqLen(), cfg.ropeTheta());
+        RotaryEmbedding rope = new RotaryEmbedding(cfg.headDim(), cfg.maxSeqLen(), cfg.ropeTheta(),
+                cfg.ropeScaling());
 
         Qwen3Block[] blocks = new Qwen3Block[cfg.nLayer()];
         for (int i = 0; i < cfg.nLayer(); i++) {
@@ -284,8 +404,11 @@ public final class Qwen3Loader {
             Linear k = src.linear(p + "self_attn.k_proj.weight", cfg.dModel(), cfg.kvDim());
             Linear v = src.linear(p + "self_attn.v_proj.weight", cfg.dModel(), cfg.kvDim());
             Linear o = src.linear(p + "self_attn.o_proj.weight", cfg.qDim(), cfg.dModel());
-            RmsNorm qNorm = src.rmsNorm(p + "self_attn.q_norm.weight", cfg.headDim(), cfg.rmsNormEps());
-            RmsNorm kNorm = src.rmsNorm(p + "self_attn.k_norm.weight", cfg.headDim(), cfg.rmsNormEps());
+            // Llama 等无 QK-Norm：对应张量不存在，跳过加载
+            RmsNorm qNorm = cfg.qkNorm()
+                    ? src.rmsNorm(p + "self_attn.q_norm.weight", cfg.headDim(), cfg.rmsNormEps()) : null;
+            RmsNorm kNorm = cfg.qkNorm()
+                    ? src.rmsNorm(p + "self_attn.k_norm.weight", cfg.headDim(), cfg.rmsNormEps()) : null;
             Qwen3Attention attn = new Qwen3Attention(cfg, q, k, v, o, qNorm, kNorm, rope);
             Linear gate = src.linear(p + "mlp.gate_proj.weight", cfg.dModel(), cfg.dFfn());
             Linear up = src.linear(p + "mlp.up_proj.weight", cfg.dModel(), cfg.dFfn());

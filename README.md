@@ -15,7 +15,7 @@ mini-vllm 是一个**学习型项目**，用 Java + Maven（仅 JDK 标准库，
 - **Continuous Batching**：`LLMEngine` 的 admit → decode → sweep 三段循环，请求随时进出，KV 显存不足时回滚等待
 - **双模型架构**：除 Qwen3 外，内置 GPT-2/GPT-3 学习微模型（含 GPT-3 交替稠密/局部带状稀疏注意力、标准规模预设）
 - **BPE 分词器**：纯 Java 实现 byte-level BPE（vocab.json + merges.txt 或单文件 tokenizer.json），pre-token 正则按模型声明自适应，ChatML 对话模板，增量 UTF-8 解码避免流式乱码
-- **权重加载**：纯 Java 解析 safetensors 二进制（含 BF16 / F16 解码）；模型自动下载（ModelScope 优先、HF 兜底，断点续传 + 原子改名）
+- **权重加载**：纯 Java 解析 safetensors 二进制（含 BF16 / F16 解码）；支持 mmap 按需调页（权重不落堆，物理内存小于模型体积也能运行）；模型自动下载（ModelScope 优先、HF 兜底，断点续传 + 原子改名）
 - **OpenAI 兼容 API**：JDK HttpServer 实现 `/v1/chat/completions`（SSE 流式）、`/v1/completions`、`/v1/models`
 - **内置 Web 对话页**：零前端依赖的单页应用，可在页头切换模型，开箱即用
 - **SIMD 加速**：`DotKernel` 基于 JDK Vector API（incubator），缺失时自动回退标量实现
@@ -83,6 +83,10 @@ java -cp target/classes io.leavesfly.minivllm.MiniVllmServer --port 8080
 
 > `models/` 已 gitignore，不随仓库分发。目录下无任何模型时会回退到自动下载 Qwen3-0.6B （约 1.5GB）。
 > 同时服务 MiniMind3 与 Qwen3-0.6B 时（两者各持一套权重与 KV 池）建议加 `-Xmx6g`。
+> 堆内存要求与常驻精度强相关：默认 f32 常驻时权重在堆上约为磁盘文件的两倍
+>（Qwen3-0.6B 约需 3GB 可用堆），堆不够会在加载前直接报错并给出建议；
+> 受限堆环境请用 `--precision bf16/int8/int4` 降低常驻精度，
+> 或用 `--precision mmap` 令权重完全不占堆（内存映射按需调页，512MB 堆即可跑 1.5GB 的 Qwen3-0.6B）。
 
 只服务指定模型（可重复传入或逗号分隔多个，首个为默认模型）：
 
@@ -169,6 +173,8 @@ print(resp.choices[0].message.content)
 | `--max-seqs` | Qwen3=2 / 学习模式=8 | 最大并发请求数（continuous batching 上限） |
 | `--num-blocks` | 自动估算 | KV cache block 池大小 |
 | `--max-seq-len` | 2048 | Qwen3 上下文上限（RoPE 表与 KV 池按此分配） |
+| `--precision` | f32 | 权重常驻方式：`f32` / `bf16` / `int8` / `int4`（per-group 量化）/ `mmap`（内存映射不落堆，要求磁盘权重为 bf16；`--bf16` 等价 `--precision bf16`）。实测 0.6B 小模型在 Apple Silicon 上 bf16 最快，量化价值在 4B+ 大模型内存可行为；mmap 用于物理内存装不下模型的场景 |
+| `--kv-cache-dtype` | auto | KV cache 存储精度：`auto`/`f32`（默认）或 `int8`（容量与带宽约为 f32 的 1/4） |
 | `--quiet` | false | 关闭引擎每步调度日志 |
 
 ## 模型下载与缓存

@@ -25,6 +25,11 @@ public final class BlockTable {
         blockIds.add(blockId);
     }
 
+    /** 移除并返回末尾的物理 block id（投机采样回滚被拒绝草稿的 KV 用） */
+    public int removeLast() {
+        return blockIds.remove(blockIds.size() - 1);
+    }
+
     /** 取第 logicalBlockIdx 个逻辑 block 对应的物理 block id */
     public int blockIdAt(int logicalBlockIdx) {
         return blockIds.get(logicalBlockIdx);

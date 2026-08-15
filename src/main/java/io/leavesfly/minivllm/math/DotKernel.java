@@ -26,6 +26,18 @@ interface DotKernel {
     float dot(float[] a, int aOff, float[] b, int bOff, int len);
 
     /**
+     * 堆外点积：a 为堆上 f32 激活，b 为 direct ByteBuffer（KV block 堆外存储），
+     * bByteOff 为字节偏移。与 {@link #dot} 算术等价，但 K/V 无需拷回堆上。
+     */
+    float dotOffHeap(float[] a, int aOff, java.nio.ByteBuffer b, int bByteOff, int len);
+
+    /**
+     * 堆外加权累加：dst[dOff+i] += w * src.getFloat(sByteOff+i*4)，src 为 direct ByteBuffer。
+     * KV cache 堆外化后 attention 的 V 加权求和直接在堆外数据上进行。
+     */
+    void axpyOffHeap(float w, java.nio.ByteBuffer src, int sByteOff, float[] dst, int dOff, int len);
+
+    /**
      * BF16 权重 × F32 激活 的点积：a 为 bf16 位（short），b 为 f32。
      * a[i] 的 bf16 位左移 16 位即得 f32（与 {@link Bf16#bf16ToFloat} 一致），
      * 与"先整体转 f32 再点积"算术等价，但权重只占一半内存/带宽。
@@ -39,10 +51,24 @@ interface DotKernel {
     float dotInt8(byte[] w, int wOff, float[] x, int xOff, int len, float scale);
 
     /**
+     * INT4 量化权重 × F32 激活 的点积（per-group 对称量化，Q4_0 风格打包）。
+     * w 为 packed 4-bit：组内前半元素在低 nibble、后半在高 nibble（存储值 = q+8），
+     * wOff 为字节偏移（= 元素起始 / 2）；scales[sOff + i/groupSize] 为该组缩放因子。
+     * 结果 = Σ_g scales[g] * Σ_{i∈g} (nibble(i)-8) * x[i]。要求 len % groupSize == 0。
+     */
+    float dotInt4(byte[] w, int wOff, float[] x, int xOff, int len, float[] scales, int sOff, int groupSize);
+
+    /**
      * 加权累加：dst[dOff+i] += w * src[sOff+i]，i∈[0,len)。
      * 用于 attention 的 V 加权求和，向量化后可显著加速长上下文 decode。
      */
     void axpy(float w, float[] src, int sOff, float[] dst, int dOff, int len);
+
+    /**
+     * INT8 量化行的加权累加：dst[dOff+i] += w * scale * src[sOff+i]，src 为 signed byte。
+     * 用于 KV cache 量化后在量化域直接做 V 加权求和，避免整行反量化物化为 f32。
+     */
+    void axpyInt8(float w, byte[] src, int sOff, float[] dst, int dOff, int len, float scale);
 
     /** 内核名称（启动日志用） */
     String name();
@@ -74,6 +100,23 @@ final class ScalarDotKernel implements DotKernel {
     }
 
     @Override
+    public float dotOffHeap(float[] a, int aOff, java.nio.ByteBuffer b, int bByteOff, int len) {
+        float sum = 0f;
+        for (int i = 0; i < len; i++) {
+            sum += a[aOff + i] * b.getFloat(bByteOff + i * 4);
+        }
+        return sum;
+    }
+
+    @Override
+    public void axpyOffHeap(float w, java.nio.ByteBuffer src, int sByteOff, float[] dst, int dOff, int len) {
+        for (int i = 0; i < len; i++) {
+            dst[dOff + i] += w * src.getFloat(sByteOff + i * 4);
+        }
+        return;
+    }
+
+    @Override
     public float dotInt8(byte[] w, int wOff, float[] x, int xOff, int len, float scale) {
         float sum = 0f;
         for (int i = 0; i < len; i++) {
@@ -83,9 +126,37 @@ final class ScalarDotKernel implements DotKernel {
     }
 
     @Override
+    public float dotInt4(byte[] w, int wOff, float[] x, int xOff, int len,
+                         float[] scales, int sOff, int groupSize) {
+        float sum = 0f;
+        int half = groupSize / 2;
+        int groups = len / groupSize;
+        for (int g = 0; g < groups; g++) {
+            int elemBase = xOff + g * groupSize;
+            int packBase = wOff + g * half;
+            float gsum = 0f;
+            for (int j = 0; j < half; j++) {
+                int b = w[packBase + j] & 0xFF;
+                gsum += ((b & 0xF) - 8) * x[elemBase + j];
+                gsum += ((b >>> 4) - 8) * x[elemBase + half + j];
+            }
+            sum += scales[sOff + g] * gsum;
+        }
+        return sum;
+    }
+
+    @Override
     public void axpy(float w, float[] src, int sOff, float[] dst, int dOff, int len) {
         for (int i = 0; i < len; i++) {
             dst[dOff + i] += w * src[sOff + i];
+        }
+    }
+
+    @Override
+    public void axpyInt8(float w, byte[] src, int sOff, float[] dst, int dOff, int len, float scale) {
+        float ws = w * scale;
+        for (int i = 0; i < len; i++) {
+            dst[dOff + i] += ws * (float) src[sOff + i];
         }
     }
 
@@ -198,6 +269,58 @@ final class VectorDotKernel implements DotKernel {
     }
 
     @Override
+    public float dotOffHeap(float[] a, int aOff, java.nio.ByteBuffer b, int bByteOff, int len) {
+        // 与 dot 同构的 4 路累加器：fromByteBuffer 直接从堆外段加载（要求 nativeOrder）
+        int i = 0;
+        int lanes = SPECIES.length();
+        int step = lanes * 4;
+        FloatVector acc0 = FloatVector.zero(SPECIES);
+        FloatVector acc1 = FloatVector.zero(SPECIES);
+        FloatVector acc2 = FloatVector.zero(SPECIES);
+        FloatVector acc3 = FloatVector.zero(SPECIES);
+        for (int bound4 = len - len % step; i < bound4; i += step) {
+            acc0 = FloatVector.fromArray(SPECIES, a, aOff + i)
+                    .fma(fromBuffer(b, bByteOff + i * 4), acc0);
+            acc1 = FloatVector.fromArray(SPECIES, a, aOff + i + lanes)
+                    .fma(fromBuffer(b, bByteOff + (i + lanes) * 4), acc1);
+            acc2 = FloatVector.fromArray(SPECIES, a, aOff + i + lanes * 2)
+                    .fma(fromBuffer(b, bByteOff + (i + lanes * 2) * 4), acc2);
+            acc3 = FloatVector.fromArray(SPECIES, a, aOff + i + lanes * 3)
+                    .fma(fromBuffer(b, bByteOff + (i + lanes * 3) * 4), acc3);
+        }
+        for (; i < SPECIES.loopBound(len); i += lanes) {
+            acc0 = FloatVector.fromArray(SPECIES, a, aOff + i)
+                    .fma(fromBuffer(b, bByteOff + i * 4), acc0);
+        }
+        float sum = acc0.add(acc1).add(acc2.add(acc3)).reduceLanes(VectorOperators.ADD);
+        for (; i < len; i++) {
+            sum += a[aOff + i] * b.getFloat(bByteOff + i * 4);
+        }
+        return sum;
+    }
+
+    /** 从堆外段加载一个 float 向量（本机字节序，避免换序指令） */
+    private static FloatVector fromBuffer(java.nio.ByteBuffer b, int byteOff) {
+        return FloatVector.fromByteBuffer(SPECIES, b, byteOff, java.nio.ByteOrder.nativeOrder());
+    }
+
+    @Override
+    public void axpyOffHeap(float w, java.nio.ByteBuffer src, int sByteOff, float[] dst, int dOff, int len) {
+        int i = 0;
+        int lanes = SPECIES.length();
+        int bound = SPECIES.loopBound(len);
+        FloatVector wv = FloatVector.broadcast(SPECIES, w);
+        for (; i < bound; i += lanes) {
+            FloatVector sv = fromBuffer(src, sByteOff + i * 4);
+            FloatVector dv = FloatVector.fromArray(SPECIES, dst, dOff + i);
+            sv.fma(wv, dv).intoArray(dst, dOff + i);
+        }
+        for (; i < len; i++) {
+            dst[dOff + i] += w * src.getFloat(sByteOff + i * 4);
+        }
+    }
+
+    @Override
     public float dotInt8(byte[] w, int wOff, float[] x, int xOff, int len, float scale) {
         // 全向量化路径：一次加载 2N 个 byte，B2S 加宽到满宽 short，再 S2I 分 part 0/1
         // 得两组 int，I2F 转 float 后 FMA（各步均有硬件指令，勿用会退化标量的 B2F）。
@@ -228,6 +351,62 @@ final class VectorDotKernel implements DotKernel {
     }
 
     @Override
+    public float dotInt4(byte[] w, int wOff, float[] x, int xOff, int len,
+                         float[] scales, int sOff, int groupSize) {
+        // 解包链：packed byte →（AND 0x0F / LSHR 4 拆 nibble）→ B2S → S2I → 减 8 → I2F，
+        // 各步均有硬件指令（勿用会退化标量的 B2F）。Q4_0 布局下 lo/hi nibble 各对应
+        // 组内前/后半连续元素段，可直接 fromArray 加载 x 做 FMA。
+        // scale 每组不同：先把权重向量乘 scale 再 fma，跨组共用 4 路累加器、一次归约。
+        int half = groupSize / 2;
+        int groups = len / groupSize;
+        int lanes = SPECIES.length();
+        int byteLanes = BYTE_SPECIES.length(); // = 2 * lanes，一次加载 2N 个 packed byte
+        FloatVector acc0 = FloatVector.zero(SPECIES);
+        FloatVector acc1 = FloatVector.zero(SPECIES);
+        FloatVector acc2 = FloatVector.zero(SPECIES);
+        FloatVector acc3 = FloatVector.zero(SPECIES);
+        float sum = 0f;
+        for (int g = 0; g < groups; g++) {
+            int elemBase = xOff + g * groupSize;
+            int packBase = wOff + g * half;
+            FloatVector sv = FloatVector.broadcast(SPECIES, scales[sOff + g]);
+            int j = 0;
+            for (; j + byteLanes <= half; j += byteLanes) {
+                ByteVector bv = ByteVector.fromArray(BYTE_SPECIES, w, packBase + j);
+                // 低 nibble → 组内前半元素 [elemBase+j, +2N)
+                ShortVector loS = (ShortVector) bv.lanewise(VectorOperators.AND, (byte) 0x0F)
+                        .convertShape(VectorOperators.B2S, SHORT_FULL_SPECIES, 0);
+                FloatVector w0 = i2fMinus8(loS, 0).mul(sv);
+                FloatVector w1 = i2fMinus8(loS, 1).mul(sv);
+                acc0 = w0.fma(FloatVector.fromArray(SPECIES, x, elemBase + j), acc0);
+                acc1 = w1.fma(FloatVector.fromArray(SPECIES, x, elemBase + j + lanes), acc1);
+                // 高 nibble → 组内后半元素 [elemBase+half+j, +2N)
+                ShortVector hiS = (ShortVector) bv.lanewise(VectorOperators.LSHR, 4)
+                        .convertShape(VectorOperators.B2S, SHORT_FULL_SPECIES, 0);
+                FloatVector w2 = i2fMinus8(hiS, 0).mul(sv);
+                FloatVector w3 = i2fMinus8(hiS, 1).mul(sv);
+                acc2 = w2.fma(FloatVector.fromArray(SPECIES, x, elemBase + half + j), acc2);
+                acc3 = w3.fma(FloatVector.fromArray(SPECIES, x, elemBase + half + j + lanes), acc3);
+            }
+            // 组内尾部（half 不足一次向量加载时）标量解包
+            float tail = 0f;
+            for (; j < half; j++) {
+                int b = w[packBase + j] & 0xFF;
+                tail += ((b & 0xF) - 8) * x[elemBase + j];
+                tail += ((b >>> 4) - 8) * x[elemBase + half + j];
+            }
+            sum += scales[sOff + g] * tail;
+        }
+        return sum + acc0.add(acc1).add(acc2.add(acc3)).reduceLanes(VectorOperators.ADD);
+    }
+
+    /** short 向量的 part 半段 → int → 减 8 → float（nibble 还原为有符号量化值） */
+    private static FloatVector i2fMinus8(ShortVector sv, int part) {
+        IntVector iv = (IntVector) sv.convertShape(VectorOperators.S2I, INT_SPECIES, part);
+        return (FloatVector) iv.lanewise(VectorOperators.SUB, 8).convert(VectorOperators.I2F, 0);
+    }
+
+    @Override
     public void axpy(float w, float[] src, int sOff, float[] dst, int dOff, int len) {
         int i = 0;
         int lanes = SPECIES.length();
@@ -240,6 +419,31 @@ final class VectorDotKernel implements DotKernel {
         }
         for (; i < len; i++) {
             dst[dOff + i] += w * src[sOff + i];
+        }
+    }
+
+    @Override
+    public void axpyInt8(float w, byte[] src, int sOff, float[] dst, int dOff, int len, float scale) {
+        // 与 dotInt8 同构的加宽链（B2S → S2I → I2F），乘上 w*scale 后 FMA 累加到 dst
+        int i = 0;
+        int lanes = SPECIES.length();
+        int step = lanes * 2;
+        FloatVector wsv = FloatVector.broadcast(SPECIES, w * scale);
+        for (int bound2 = len - len % step; i < bound2; i += step) {
+            ByteVector bv = ByteVector.fromArray(BYTE_SPECIES, src, sOff + i);
+            ShortVector sv = (ShortVector) bv.convertShape(VectorOperators.B2S, SHORT_FULL_SPECIES, 0);
+            FloatVector f0 = (FloatVector) ((IntVector) sv
+                    .convertShape(VectorOperators.S2I, INT_SPECIES, 0))
+                    .convert(VectorOperators.I2F, 0);
+            FloatVector f1 = (FloatVector) ((IntVector) sv
+                    .convertShape(VectorOperators.S2I, INT_SPECIES, 1))
+                    .convert(VectorOperators.I2F, 0);
+            f0.fma(wsv, FloatVector.fromArray(SPECIES, dst, dOff + i)).intoArray(dst, dOff + i);
+            f1.fma(wsv, FloatVector.fromArray(SPECIES, dst, dOff + i + lanes)).intoArray(dst, dOff + i + lanes);
+        }
+        float ws = w * scale;
+        for (; i < len; i++) {
+            dst[dOff + i] += ws * (float) src[sOff + i];
         }
     }
 

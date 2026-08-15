@@ -66,7 +66,12 @@ public final class ModelLoader {
 
     /** 随机初始化（GPT-2 风格 std=0.02），无权重文件时用于跑通流程 */
     public static TransformerModel randomInit(ModelConfig cfg) {
-        Random rnd = new Random(42L);
+        return randomInit(cfg, 42L);
+    }
+
+    /** 指定种子的随机初始化：测试需要两个权重建异但确定的模型（如投机采样的草稿/目标对） */
+    public static TransformerModel randomInit(ModelConfig cfg, long seed) {
+        Random rnd = new Random(seed);
         float baseStd = 0.02f;                       // GPT-2/GPT-3 标准初始化标准差
         float resStd = cfg.residualInitStd(baseStd); // 残差投影 modified init：0.02/sqrt(2*nLayer)
         Embedding wteE = new Embedding(ArrayUtil.randNormal(rnd, cfg.vocabSize() * cfg.dModel(), 0.02f),

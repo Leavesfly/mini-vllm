@@ -70,6 +70,21 @@ public final class Qwen3Model implements LlmModel {
     }
 
     @Override
+    public float[][] prefillLogitsAll(int[] tokenIds, KVCacheManager kvMgr,
+                                      BlockTable[] bts, int startIdx) {
+        // 一次前向后对全部位置做词表投影（投机采样验证用）：避免逐位置重复前向
+        float[] hidden = prefill(tokenIds, kvMgr, bts, startIdx);      // [len, dModel]
+        float[] flat = wte.projectToVocabBatch(hidden, tokenIds.length); // [len, vocab]
+        int vocab = cfg.vocabSize();
+        float[][] out = new float[tokenIds.length][];
+        for (int i = 0; i < out.length; i++) {
+            out[i] = new float[vocab];
+            System.arraycopy(flat, i * vocab, out[i], 0, vocab);
+        }
+        return out;
+    }
+
+    @Override
     public float[] decodeLogits(int tokenId, int curIdx, KVCacheManager kvMgr, BlockTable[] bts) {
         return logits(decode(tokenId, curIdx, kvMgr, bts));
     }

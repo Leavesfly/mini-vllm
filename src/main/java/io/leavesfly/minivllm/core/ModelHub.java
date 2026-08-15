@@ -43,11 +43,16 @@ public final class ModelHub {
      * @param maxSeqLen  上下文窗口上限
      * @param maxNumSeqs 并发序列数；≤0 表示用模型家族的建议值
      * @param numBlocks  KV 池 block 数；≤0 表示按模型规模自动推算
+     * @param kvInt8     KV cache 是否 INT8 量化存储（对照 vLLM --kv-cache-dtype int8）
      * @param verbose    引擎是否打印每步调度信息
      * @param seed       采样随机种子
+     * @param speculativeK 投机采样草稿长度（0 关闭；仅 greedy 单序列生效）
+     * @param draftModel 草稿模型目录或已注册 id（null 时回退 prompt-lookup 自投机；
+     *                   需与目标模型同词表，且 speculativeK > 0 才生效）
      */
     public record Options(Precision precision, boolean random, int maxSeqLen,
-                          int maxNumSeqs, int numBlocks, boolean verbose, long seed) {
+                          int maxNumSeqs, int numBlocks, boolean kvInt8, boolean verbose, long seed,
+                          int speculativeK, String draftModel) {
     }
 
     private final Options options;
@@ -57,6 +62,8 @@ public final class ModelHub {
     private final Map<String, ModelRuntime> runtimes = new ConcurrentHashMap<>();
     private final List<String> ids = new ArrayList<>();
     private String defaultId;
+    /** 草稿模型加载缓存（多个目标运行时共享同一份草稿权重，各持独立 KV 池） */
+    private LoadedModel draftLoaded;
 
     public ModelHub(Options options) {
         this.options = options;
@@ -97,6 +104,18 @@ public final class ModelHub {
         return runtimes.get(id);
     }
 
+    /** 按注册顺序返回全部已加载的运行时（/metrics 端点用，不触发加载） */
+    public List<ModelRuntime> loadedRuntimes() {
+        List<ModelRuntime> out = new ArrayList<>();
+        for (String id : ids) {
+            ModelRuntime r = runtimes.get(id);
+            if (r != null) {
+                out.add(r);
+            }
+        }
+        return out;
+    }
+
     /** 启动预热：把默认模型提前加载好，避免首个请求等在权重 IO 上 */
     public ModelRuntime preload(String id) throws IOException {
         return get(id);
@@ -123,6 +142,7 @@ public final class ModelHub {
             LoadedModel loaded = new ModelRegistry().load(sources.get(id), options.precision(),
                     options.random(), options.maxSeqLen());
             ModelRuntime runtime = assemble(id, loaded, options);
+            maybeAttachDraft(runtime);
             runtimes.put(id, runtime);
             return runtime;
         }
@@ -137,16 +157,50 @@ public final class ModelHub {
         int maxNumSeqs = options.maxNumSeqs() > 0 ? options.maxNumSeqs() : loaded.defaultMaxSeqs();
         int numBlocks = options.numBlocks() > 0 ? options.numBlocks() : autoNumBlocks(cfg, maxNumSeqs);
 
-        KVCacheManager kvMgr = new KVCacheManager(numBlocks, cfg.blockSize(), loaded.kvDim());
-        long kvBytes = (long) numBlocks * cfg.blockSize() * loaded.kvDim() * 2 * 4;
-        System.out.printf("[%s] KV 池: %d blocks × blockSize=%d × kvDim=%d（满载约 %.1f GB）%n",
-                id, numBlocks, cfg.blockSize(), loaded.kvDim(), kvBytes / 1e9);
+        KVCacheManager kvMgr = new KVCacheManager(numBlocks, cfg.blockSize(), loaded.kvDim(),
+                options.kvInt8());
+        int bytesPerElem = options.kvInt8() ? 1 : 4; // int8 每元素 1 字节（另每 token 2 个 scale，可忽略）
+        long kvBytes = (long) numBlocks * cfg.blockSize() * loaded.kvDim() * 2 * bytesPerElem;
+        System.out.printf("[%s] KV 池: %d blocks × blockSize=%d × kvDim=%d × %s（满载约 %.1f GB）%n",
+                id, numBlocks, cfg.blockSize(), loaded.kvDim(),
+                options.kvInt8() ? "int8" : "f32", kvBytes / 1e9);
 
         LLMEngine engine = new LLMEngine(loaded.model(), kvMgr, loaded.tokenizer(),
                 maxNumSeqs, loaded.eosTokens(), options.seed());
         engine.setVerbose(options.verbose());
+        engine.setSpeculativeK(options.speculativeK());
         engine.start();
         return new ModelRuntime(id, loaded, engine, maxNumSeqs, numBlocks);
+    }
+
+    /**
+     * 为运行时装配草稿模型（draft-model 投机，对照 vLLM 的 --speculative-model）。
+     * 草稿权重全局只加载一份（缓存复用）；每个目标运行时持有独立的草稿 KV 池——
+     * 投机仅单序列生效，池按 1 并发估算即可。词表不一致时拒绝接入并告警。
+     */
+    private void maybeAttachDraft(ModelRuntime runtime) throws IOException {
+        String draftRef = options.draftModel();
+        if (draftRef == null || options.speculativeK() <= 0) {
+            return;
+        }
+        if (draftLoaded == null) {
+            Path dir = sources.containsKey(draftRef) ? sources.get(draftRef) : Path.of(draftRef);
+            System.out.println("加载草稿模型: " + dir);
+            draftLoaded = new ModelRegistry().load(dir, options.precision(),
+                    options.random(), options.maxSeqLen());
+        }
+        if (draftLoaded.config().vocabSize() != runtime.loaded().config().vocabSize()) {
+            System.out.println("[spec] 草稿模型词表（" + draftLoaded.config().vocabSize() + "）与 ["
+                    + runtime.id() + "]（" + runtime.loaded().config().vocabSize() + "）不一致，跳过投机配置");
+            return;
+        }
+        ModelConfig dcfg = draftLoaded.config();
+        int draftBlocks = autoNumBlocks(dcfg, 1); // 单序列投机：按 1 并发估算
+        KVCacheManager draftKv = new KVCacheManager(draftBlocks, dcfg.blockSize(),
+                draftLoaded.kvDim(), options.kvInt8());
+        runtime.engine().setDraftModel(draftLoaded.model(), draftKv);
+        System.out.printf("[spec] [%s] 接入草稿模型（k=%d，草稿池 %d blocks × blockSize=%d × kvDim=%d）%n",
+                runtime.id(), options.speculativeK(), draftBlocks, dcfg.blockSize(), draftLoaded.kvDim());
     }
 
     /** 按「并发数 × 层数 × 每序列块数」估算 KV 池规模，保证满载并发不会中途 OOM */

@@ -78,7 +78,10 @@ class BlockPoolTest {
         BlockPool pool = new BlockPool(2, blockSize, dModel);
         int id = pool.allocate();
         BlockPool.KVBlock block = pool.get(id);
-        assertEquals(blockSize * dModel, block.k.length);
-        assertEquals(blockSize * dModel, block.v.length);
+        // f32 KV 堆外存储：direct ByteBuffer，容量 = 元素数 × 4 字节
+        assertEquals(blockSize * dModel * 4, block.k.capacity());
+        assertEquals(blockSize * dModel * 4, block.v.capacity());
+        assertTrue(block.k.isDirect(), "f32 KV block 应为堆外 direct 缓冲");
+        assertTrue(block.v.isDirect(), "f32 KV block 应为堆外 direct 缓冲");
     }
 }

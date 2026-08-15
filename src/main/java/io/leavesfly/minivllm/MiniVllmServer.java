@@ -50,6 +50,16 @@ import java.util.stream.Stream;
  *   只服务指定模型（可重复传入或逗号分隔多个，首个为默认）：
  *     java -jar mini-vllm.jar --model-dir ./models/Qwen3-0.6B --port 8080
  *     java -jar mini-vllm.jar --model-dir ./models/minimind-3-agent-512,./models/Qwen3-0.6B
+ *   KV cache INT8 量化（容量与带宽降为 f32 的约 1/4，默认 f32）：
+ *     java -jar mini-vllm.jar --kv-cache-dtype int8 --port 8080
+ *   权重量化常驻（int4 带宽最省、int8 次之，默认 f32；--bf16 等价 --precision bf16）：
+ *     java -jar mini-vllm.jar --precision int4 --port 8080
+ *   权重 mmap 按需调页（不占堆，物理内存小于模型体积也能跑；要求磁盘权重为 bf16）：
+ *     java -jar mini-vllm.jar --precision mmap --port 8080
+ *   prompt-lookup 投机采样（greedy 单请求无损加速，默认关闭）：
+ *     java -jar mini-vllm.jar --speculative-k 4 --port 8080
+ *   草稿模型投机采样（小模型起草、大模型验证，需同词表；对照 vLLM --speculative-model）：
+ *     java -jar mini-vllm.jar --speculative-k 4 --draft-model ./models/Qwen3-0.6B --port 8080
  *
  * 测试：
  *   curl -X POST http://localhost:8080/v1/chat/completions \
@@ -88,6 +98,14 @@ public final class MiniVllmServer {
         boolean verbose = true;
         boolean gpt3 = false;
         boolean bf16 = false;
+        /** 权重常驻精度：f32（默认）/ bf16 / int8 / int4 / mmap */
+        String precision = "f32";
+        /** KV cache dtype："auto"/"f32" 保持 f32（默认），"int8" 启用量化存储 */
+        String kvCacheDtype = "auto";
+        /** 投机采样草稿长度（0 关闭；仅 greedy 单序列 decode 生效） */
+        int speculativeK = 0;
+        /** 草稿模型目录或已注册 id（null 时回退 prompt-lookup 自投机） */
+        String draftModel = null;
         String modelRepo = DEFAULT_MODEL_REPO;
         String mirror = System.getenv("MINIVLLM_MIRROR");
 
@@ -102,8 +120,10 @@ public final class MiniVllmServer {
         printRuntimeDiagnostics();
 
         ModelHub hub = new ModelHub(new ModelHub.Options(
-                config.bf16 ? Precision.BF16 : Precision.F32, config.random,
-                config.maxSeqLen, config.maxNumSeqs, config.numBlocks, config.verbose, DEFAULT_SEED));
+                parsePrecision(config), config.random,
+                config.maxSeqLen, config.maxNumSeqs, config.numBlocks,
+                "int8".equalsIgnoreCase(config.kvCacheDtype), config.verbose, DEFAULT_SEED,
+                config.speculativeK, config.draftModel));
 
         if (config.isLegacyMode()) {
             hub.adopt(ModelHub.assemble(LEGACY_MODEL_ID, loadLegacyModel(config), hub.options()));
@@ -135,15 +155,39 @@ public final class MiniVllmServer {
                 case "--random" -> config.random = true;
                 case "--gpt3" -> config.gpt3 = true;
                 case "--bf16" -> config.bf16 = true;
+                // 权重常驻精度：f32 / bf16 / int8 / int4 / mmap（int4 带宽最省，mmap 不占堆）
+                case "--precision" -> config.precision = args[++i];
                 case "--model-repo" -> config.modelRepo = args[++i];
                 case "--mirror" -> config.mirror = args[++i];
                 case "--max-seqs" -> config.maxNumSeqs = Integer.parseInt(args[++i]);
                 case "--num-blocks" -> config.numBlocks = Integer.parseInt(args[++i]);
+                // KV cache 存储精度：auto/f32（默认）或 int8（对照 vLLM --kv-cache-dtype）
+                case "--kv-cache-dtype" -> config.kvCacheDtype = args[++i];
+                // 投机采样草稿长度：0 关闭（默认），建议 3~5（对照 vLLM num_speculative_tokens）
+                case "--speculative-k" -> config.speculativeK = Integer.parseInt(args[++i]);
+                // 草稿模型：目录路径或已注册的模型 id（需与目标模型同词表；对照 vLLM --speculative-model）
+                case "--draft-model" -> config.draftModel = args[++i];
                 case "--quiet" -> config.verbose = false;
                 default -> { }
             }
         }
         return config;
+    }
+
+    /** 权重精度解析：--precision 优先，--bf16 为旧版兼容开关 */
+    private static Precision parsePrecision(ServerConfig config) {
+        if (config.bf16) {
+            return Precision.BF16;
+        }
+        return switch (config.precision.toLowerCase()) {
+            case "f32" -> Precision.F32;
+            case "bf16" -> Precision.BF16;
+            case "int8" -> Precision.INT8;
+            case "int4" -> Precision.INT4;
+            case "mmap" -> Precision.MMAP;
+            default -> throw new IllegalArgumentException(
+                    "未知 --precision: " + config.precision + "（可选 f32/bf16/int8/int4/mmap）");
+        };
     }
 
     private static List<String> splitDirs(String value) {
@@ -226,6 +270,8 @@ public final class MiniVllmServer {
         int maxNumSeqs = primary != null ? primary.maxNumSeqs() : DEFAULT_LEARNING_MAX_SEQS;
         HttpServer server = HttpServer.create(new InetSocketAddress(port), 0);
         server.createContext("/v1", new OpenAiHandler(hub));
+        // /metrics 不在 /v1 前缀下，需单独注册（同一 handler 按 path 分发）
+        server.createContext("/metrics", new OpenAiHandler(hub));
         server.createContext("/", new WebUiHandler());
         server.setExecutor(Executors.newFixedThreadPool(Math.max(16, maxNumSeqs * 4)));
         server.start();
@@ -251,6 +297,7 @@ public final class MiniVllmServer {
         System.out.println("  页面: http://localhost:" + port + "/  (对话演示，可在右上角切换模型)");
         System.out.println("  端点: POST /v1/chat/completions  (model 字段选模型)");
         System.out.println("        GET  /v1/models");
+        System.out.println("        GET  /metrics  (引擎指标：TTFT/ITL/吞吐/KV 利用率)");
         System.out.println("  模型: (* 为默认)");
         for (String id : hub.ids()) {
             System.out.println("    " + (id.equals(hub.defaultId()) ? "*" : " ") + " "

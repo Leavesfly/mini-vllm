@@ -15,20 +15,36 @@ import java.util.function.Predicate;
  *    这就是 continuous batching：请求随时进出，batch 始终尽量满。
  * 3. waiting 用并发安全队列，因为 HTTP 线程随时 add，engine 线程消费。
  * 4. running 仅由 engine 线程读写，不暴露可变引用给外部。
+ * 5. tokenBudget：每步前向的 token 总预算（对照 vLLM max_num_batched_tokens）：
+ *    decode 请求各占 1 token，剩余预算切给 prefill chunk，防止长 prompt 阻塞 decode。
  */
 public final class Scheduler {
+
+    /** 默认每步 token 预算（需 ≥ maxNumSeqs，否则 prefill 会饿死） */
+    public static final int DEFAULT_TOKEN_BUDGET = 512;
 
     private final ConcurrentLinkedDeque<Sequence> waiting = new ConcurrentLinkedDeque<>();
     private final List<Sequence> running = new ArrayList<>();
     private final int maxNumSeqs;
+    private final int tokenBudget;
 
     public Scheduler(int maxNumSeqs) {
+        this(maxNumSeqs, DEFAULT_TOKEN_BUDGET);
+    }
+
+    public Scheduler(int maxNumSeqs, int tokenBudget) {
         this.maxNumSeqs = maxNumSeqs;
+        this.tokenBudget = tokenBudget;
     }
 
     /** HTTP 线程调用：加入新请求 */
     public void add(Sequence seq) {
         waiting.add(seq);
+    }
+
+    /** 被抢占序列退回队首（防饿死：优先于普通新请求重新 admit） */
+    public void addFirstWaiting(Sequence seq) {
+        waiting.addFirst(seq);
     }
 
     /** 查看待 prefill 队列头部（不取出） */
@@ -44,6 +60,11 @@ public final class Scheduler {
     /** 从 waiting 中移除指定请求（SchedulingPolicy 选中并分配成功后调用） */
     public boolean removeWaiting(Sequence seq) {
         return waiting.remove(seq);
+    }
+
+    /** 按条件批量移除 waiting 中的请求（如清扫已取消的请求，engine 线程调用） */
+    public void removeWaitingIf(Predicate<Sequence> condition) {
+        waiting.removeIf(condition);
     }
 
     /** 将请求加入 running 列表 */
@@ -78,6 +99,11 @@ public final class Scheduler {
 
     public int maxNumSeqs() {
         return maxNumSeqs;
+    }
+
+    /** 每步前向的 token 总预算（decode 优先，剩余给 prefill chunk） */
+    public int tokenBudget() {
+        return tokenBudget;
     }
 
     /** 是否还有工作要做 */

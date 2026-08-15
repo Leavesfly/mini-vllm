@@ -3,46 +3,55 @@ package io.leavesfly.minivllm.model;
 import io.leavesfly.minivllm.math.Bf16;
 import io.leavesfly.minivllm.math.Matmul;
 
+import java.nio.ShortBuffer;
+
 /**
  * 嵌入层 —— 把 token id 映射为稠密向量，是 TransformerModel 的输入入口。
  *
  * 学习要点：
  * 1. 本质是一张查表：weight 形状 [vocabSize, dModel]，第 id 行就是 token id 的向量。
  * 2. GPT-2 中词嵌入与 lm_head 共享权重（tieWordEmbeddings），即用同一张表做输入查表和输出投影。
- * 3. 支持 F32 / BF16 / INT8 三种常驻精度。tied 下这张表既是最大的权重（vocab×d），
- *    又兼作 lm_head——int8 量化可使 lm_head 带宽降至 bf16 的一半。
+ * 3. 支持 F32 / BF16 / INT8 / mmap-BF16 四种常驻方式。tied 下这张表既是最大的权重（vocab×d），
+ *    又兼作 lm_head——int8 量化可使 lm_head 带宽降至 bf16 的一半；mmap 则令它完全不占堆。
  */
 public final class Embedding {
 
-    private final float[] weight;        // [vocabSize, dModel] 行优先；bf16/int8 模式为 null
-    private final short[] weightBf16;    // bf16 位版；f32/int8 模式为 null
-    private final byte[] weightInt8;     // int8 量化版；f32/bf16 模式为 null
+    private final float[] weight;        // [vocabSize, dModel] 行优先；其它模式为 null
+    private final short[] weightBf16;    // bf16 位版；其它模式为 null
+    private final byte[] weightInt8;     // int8 量化版；其它模式为 null
     private final float[] scaleInt8;     // int8 per-row scale [vocabSize]；非 int8 为 null
+    private final ShortBuffer weightMmapBf16; // mmap bf16 视图（不落堆）；非 mmap 为 null
     private final int vocabSize;
     private final int dModel;
 
     public Embedding(float[] weight, int vocabSize, int dModel) {
-        this(weight, null, null, null, vocabSize, dModel);
+        this(weight, null, null, null, null, vocabSize, dModel);
     }
 
     private Embedding(float[] weight, short[] weightBf16, byte[] weightInt8, float[] scaleInt8,
-                      int vocabSize, int dModel) {
+                      ShortBuffer weightMmapBf16, int vocabSize, int dModel) {
         this.weight = weight;
         this.weightBf16 = weightBf16;
         this.weightInt8 = weightInt8;
         this.scaleInt8 = scaleInt8;
+        this.weightMmapBf16 = weightMmapBf16;
         this.vocabSize = vocabSize;
         this.dModel = dModel;
     }
 
     /** BF16 位权重常驻构造 */
     public static Embedding ofBf16(short[] weightBf16, int vocabSize, int dModel) {
-        return new Embedding(null, weightBf16, null, null, vocabSize, dModel);
+        return new Embedding(null, weightBf16, null, null, null, vocabSize, dModel);
     }
 
     /** INT8 量化权重构造 */
     public static Embedding ofInt8(byte[] weightInt8, float[] scaleInt8, int vocabSize, int dModel) {
-        return new Embedding(null, null, weightInt8, scaleInt8, vocabSize, dModel);
+        return new Embedding(null, null, weightInt8, scaleInt8, null, vocabSize, dModel);
+    }
+
+    /** mmap bf16 视图构造（权重不落堆，OS 页缓存按需调页） */
+    public static Embedding ofMmapBf16(ShortBuffer weightMmapBf16, int vocabSize, int dModel) {
+        return new Embedding(null, null, null, null, weightMmapBf16, vocabSize, dModel);
     }
 
     // ─── 访问器（与 Linear 风格对齐） ───
@@ -64,6 +73,11 @@ public final class Embedding {
         return weightInt8 != null;
     }
 
+    /** 是否为 mmap bf16 权重（不落堆） */
+    public boolean isMmapBf16() {
+        return weightMmapBf16 != null;
+    }
+
     /** 查单个 token 的向量（返回拷贝） */
     public float[] lookup(int id) {
         float[] r = new float[dModel];
@@ -77,6 +91,11 @@ public final class Embedding {
             int off = id * dModel;
             for (int d = 0; d < dModel; d++) {
                 r[d] = Bf16.bf16ToFloat(weightBf16[off + d] & 0xFFFF);
+            }
+        } else if (weightMmapBf16 != null) {
+            int off = id * dModel;
+            for (int d = 0; d < dModel; d++) {
+                r[d] = Bf16.bf16ToFloat(weightMmapBf16.get(off + d) & 0xFFFF);
             }
         } else {
             System.arraycopy(weight, id * dModel, r, 0, dModel);
@@ -101,6 +120,12 @@ public final class Embedding {
                 for (int d = 0; d < dModel; d++) {
                     r[dst + d] = Bf16.bf16ToFloat(weightBf16[off + d] & 0xFFFF);
                 }
+            } else if (weightMmapBf16 != null) {
+                int off = ids[i] * dModel;
+                int dst = i * dModel;
+                for (int d = 0; d < dModel; d++) {
+                    r[dst + d] = Bf16.bf16ToFloat(weightMmapBf16.get(off + d) & 0xFFFF);
+                }
             } else {
                 System.arraycopy(weight, ids[i] * dModel, r, i * dModel, dModel);
             }
@@ -121,6 +146,8 @@ public final class Embedding {
             return Matmul.matVecInt8(weightInt8, scaleInt8, hidden, vocabSize, dModel);
         } else if (weightBf16 != null) {
             return Matmul.matVecBf16(weightBf16, hidden, vocabSize, dModel);
+        } else if (weightMmapBf16 != null) {
+            return Matmul.matVecBf16Mapped(weightMmapBf16, hidden, vocabSize, dModel);
         } else {
             return Matmul.matVec(weight, hidden, vocabSize, dModel);
         }
@@ -152,8 +179,18 @@ public final class Embedding {
         float[][] out = new float[batch][vocabSize];
         boolean int8 = weightInt8 != null;
         boolean bf16 = weightBf16 != null;
+        boolean mmap = weightMmapBf16 != null;
         Matmul.parallelRows(vocabSize, v -> {
             int wOff = v * dModel;
+            if (mmap) {
+                // 每词表行读一次进线程私有缓冲，复用到全部 batch 个 hidden
+                short[] wRow = Matmul.mmapRowBuffer(dModel);
+                weightMmapBf16.get(wOff, wRow, 0, dModel);
+                for (int b = 0; b < batch; b++) {
+                    out[b][v] = Matmul.dotBf16(wRow, 0, hidden, b * dModel, dModel);
+                }
+                return;
+            }
             for (int b = 0; b < batch; b++) {
                 float dot;
                 if (int8) {
@@ -171,6 +208,15 @@ public final class Embedding {
 
     /** 参数量（vocabSize * dModel） */
     public long numParameters() {
-        return weight != null ? weight.length : (weightBf16 != null ? weightBf16.length : weightInt8.length);
+        if (weight != null) {
+            return weight.length;
+        }
+        if (weightBf16 != null) {
+            return weightBf16.length;
+        }
+        if (weightMmapBf16 != null) {
+            return weightMmapBf16.capacity();
+        }
+        return weightInt8.length;
     }
 }

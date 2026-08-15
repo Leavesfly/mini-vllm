@@ -77,4 +77,33 @@ class SamplerTest {
             assertEquals(s1.sample(logits.clone()), s2.sample(logits.clone()));
         }
     }
+
+    @Test
+    void minPFiltersLowProbabilityTokens() {
+        // softmax([10,1,0,2]) 中 token 0 概率 ≈0.999；min-p=0.5 时阈值 ≈0.5，
+        // 其余 token 概率均 < 0.5 → 只允许采出 token 0
+        Sampler sampler = new Sampler(7L);
+        sampler.configure(1.0f, 0, 1.0f, 0.5f);
+        float[] logits = {10f, 1f, 0f, 2f};
+        for (int i = 0; i < 50; i++) {
+            assertEquals(0, sampler.sample(logits), "min-p=0.5 应只留下唯一的高概率 token");
+        }
+    }
+
+    @Test
+    void minPZeroKeepsFullDistribution() {
+        // min-p=0（不启用）时行为与三参 configure 一致：低概率 token 仍可被采出
+        Sampler sampler = new Sampler(7L);
+        sampler.configure(1.0f, 0, 1.0f, 0.0f);
+        float[] logits = {0f, 0f, 0f, 0f};
+        int distinct = 0;
+        boolean[] seen = new boolean[4];
+        for (int i = 0; i < 200; i++) {
+            seen[sampler.sample(logits)] = true;
+        }
+        for (boolean s : seen) {
+            if (s) distinct++;
+        }
+        assertTrue(distinct >= 3, "均匀分布下应采出多个不同 token");
+    }
 }

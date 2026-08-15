@@ -29,8 +29,15 @@ public final class ModelConfig {
     private boolean tieWordEmbeddings = true; // GPT-2/GPT-3 词嵌入与 lm_head 共享权重
 
     // ─── Qwen3 / 现代 LLM 架构字段 ───
-    /** 架构标识："gpt2"（含 GPT-3 变体）或 "qwen3" */
+    /** 架构标识："gpt2"（含 GPT-3 变体）或 HF config.json 的 model_type（如 "qwen3"/"llama"） */
     private String arch = "gpt2";
+    /** 是否有 QK-Norm（Qwen3 特有；Llama 等无）。fromConfigJson 按 model_type 自动判定 */
+    private boolean qkNorm = false;
+    /**
+     * RoPE 频率缩放参数（llama3 风格）：[factor, lowFreqFactor, highFreqFactor, originalMaxPosEmbeddings]；
+     * null 表示不缩放。来自 config.json 的 rope_scaling（rope_type=llama3）。
+     */
+    private float[] ropeScaling = null;
     /** GQA 的 KV 头数；0 表示与 nHead 相同（即 MHA） */
     private int nKVHead = 0;
     /** 显式注意力头维度；0 表示 dModel/nHead。Qwen3 为 128（与 dModel 无关） */
@@ -65,6 +72,10 @@ public final class ModelConfig {
     public float layerNormEps() { return layerNormEps; }
     public boolean tieWordEmbeddings() { return tieWordEmbeddings; }
     public String arch() { return arch; }
+    /** 是否有 QK-Norm（Qwen3 有，Llama 无） */
+    public boolean qkNorm() { return qkNorm; }
+    /** RoPE llama3 缩放参数 [factor, lowFreq, highFreq, origMaxLen]；null 表示不缩放 */
+    public float[] ropeScaling() { return ropeScaling; }
     public int nKVHead() { return nKVHead; }
     public float ropeTheta() { return ropeTheta; }
     public float rmsNormEps() { return rmsNormEps; }
@@ -215,15 +226,19 @@ public final class ModelConfig {
     }
 
     /**
-     * 从 HuggingFace config.json 解析 Qwen3 配置。
+     * 从 HuggingFace config.json 解析现代 LLM 配置（Qwen3/Llama 等标准命名字段）。
      * 对应字段：hidden_size / num_attention_heads / num_key_value_heads / head_dim /
-     * num_hidden_layers / intermediate_size / vocab_size / rope_theta / rms_norm_eps /
-     * max_position_embeddings / tie_word_embeddings / eos_token_id。
+     * num_hidden_layers / intermediate_size / vocab_size / rope_theta / rope_scaling /
+     * rms_norm_eps / max_position_embeddings / tie_word_embeddings / eos_token_id。
+     * QK-Norm 按 model_type 判定（目前仅 qwen3 有）；rope_scaling 仅支持 llama3 类型。
      */
     public static ModelConfig fromConfigJson(java.util.Map<String, Object> json) {
         ModelConfig c = new ModelConfig();
-        c.arch = "qwen3";
-        c.name = String.valueOf(json.getOrDefault("model_type", "qwen3"));
+        String modelType = String.valueOf(json.getOrDefault("model_type", "qwen3"));
+        c.arch = modelType;
+        c.qkNorm = "qwen3".equals(modelType); // 目前仅 Qwen3 有 QK-Norm
+        c.ropeScaling = parseRopeScaling(json.get("rope_scaling"));
+        c.name = modelType;
         c.vocabSize = intOf(json, "vocab_size", 151936);
         c.dModel = intOf(json, "hidden_size", 1024);
         c.nHead = intOf(json, "num_attention_heads", 16);
@@ -245,6 +260,29 @@ public final class ModelConfig {
             c.eosTokenIds = new int[]{n.intValue()};
         }
         return c;
+    }
+
+    /**
+     * 解析 rope_scaling 字段为 llama3 缩放参数 [factor, lowFreq, highFreq, origMaxLen]；
+     * 无该字段返回 null；rope_type 非 llama3 时抛错（linear/dynamic/yarn 等暂未支持）。
+     */
+    private static float[] parseRopeScaling(Object scaling) {
+        if (scaling == null) {
+            return null;
+        }
+        if (!(scaling instanceof java.util.Map<?, ?> m)) {
+            throw new IllegalArgumentException("rope_scaling 应为对象: " + scaling);
+        }
+        Object ropeType = m.get("rope_type");
+        if (!"llama3".equals(ropeType)) {
+            throw new IllegalArgumentException("暂不支持的 rope_scaling 类型: " + ropeType
+                    + "（仅支持 llama3）");
+        }
+        return new float[]{
+                ((Number) m.get("factor")).floatValue(),
+                ((Number) m.get("low_freq_factor")).floatValue(),
+                ((Number) m.get("high_freq_factor")).floatValue(),
+                ((Number) m.get("original_max_position_embeddings")).floatValue()};
     }
 
     private static int intOf(java.util.Map<String, Object> j, String k, int def) {

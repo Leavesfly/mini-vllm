@@ -13,6 +13,9 @@ package io.leavesfly.minivllm.model;
  * 2. invFreq[i] = theta^(-2i/headDim)，i ∈ [0, headDim/2)；Qwen3 theta=1000000。
  * 3. 相对位置特性：Q·K 的点积只依赖相对位置 (m-n)，因此 RoPE 只作用 Q/K，不作用 V。
  * 4. cos/sin 表按位置预计算 [maxSeqLen, headDim/2]，推理时查表即可。
+ * 5. 长上下文外推（可选）：llama3 风格频率缩放——按波长分三段处理 invFreq，
+ *    波长短于 origLen/highFreq 不变（高频保局部细节），长于 origLen/lowFreq 除以
+ *    factor（低频扩上下文），中间平滑插值（对齐 HF transformers 的 llama3 实现）。
  */
 public final class RotaryEmbedding {
 
@@ -23,6 +26,14 @@ public final class RotaryEmbedding {
     private final float[] sin; // [maxSeqLen, halfDim] 行优先
 
     public RotaryEmbedding(int headDim, int maxSeqLen, float theta) {
+        this(headDim, maxSeqLen, theta, null);
+    }
+
+    /**
+     * @param llama3Scaling llama3 频率缩放参数 [factor, lowFreqFactor, highFreqFactor,
+     *                      originalMaxPosEmbeddings]；null 表示不缩放
+     */
+    public RotaryEmbedding(int headDim, int maxSeqLen, float theta, float[] llama3Scaling) {
         this.headDim = headDim;
         this.halfDim = headDim / 2;
         this.maxSeqLen = maxSeqLen;
@@ -31,11 +42,30 @@ public final class RotaryEmbedding {
         for (int pos = 0; pos < maxSeqLen; pos++) {
             for (int i = 0; i < halfDim; i++) {
                 double invFreq = 1.0 / Math.pow(theta, 2.0 * i / headDim);
+                if (llama3Scaling != null) {
+                    invFreq = applyLlama3Scaling(invFreq, llama3Scaling);
+                }
                 double angle = pos * invFreq;
                 cos[pos * halfDim + i] = (float) Math.cos(angle);
                 sin[pos * halfDim + i] = (float) Math.sin(angle);
             }
         }
+    }
+
+    /** llama3 频率缩放：短波长不变、长波长除 factor、中间平滑过渡（HF 对齐公式） */
+    private static double applyLlama3Scaling(double invFreq, float[] s) {
+        double factor = s[0];
+        double lowWaveLen = s[3] / s[1];   // originalMaxLen / lowFreqFactor
+        double highWaveLen = s[3] / s[2];  // originalMaxLen / highFreqFactor
+        double waveLen = 2.0 * Math.PI / invFreq;
+        if (waveLen < highWaveLen) {
+            return invFreq;
+        }
+        if (waveLen > lowWaveLen) {
+            return invFreq / factor;
+        }
+        double smooth = (s[3] / waveLen - s[1]) / (s[2] - s[1]);
+        return (1 - smooth) * invFreq / factor + smooth * invFreq;
     }
 
     public int headDim() {

@@ -62,6 +62,25 @@ public interface LlmModel {
         return out;
     }
 
+    /**
+     * 多位置前向：从 startIdx 起计算 tokenIds 每个位置的词表 logits（返回逐位置全部）。
+     *
+     * 投机采样验证用：草稿 k 个 token 需要 k 个连续位置的 logits 来逐个比对接受。
+     * 因果注意力保证位置 i 的输出只见 ≤ i 的 KV，因此第 i 组 logits 与逐 token
+     * decode 到该位置的结果算术一致。默认实现逐位置回退 {@link #decodeLogits}；
+     * 支持批量前向的模型（如 Qwen3）可覆盖为一次前向投影全部位置。
+     *
+     * @return [tokenIds.length][vocabSize] 逐位置 logits
+     */
+    default float[][] prefillLogitsAll(int[] tokenIds, KVCacheManager kvMgr,
+                                       BlockTable[] bts, int startIdx) {
+        float[][] out = new float[tokenIds.length][];
+        for (int i = 0; i < tokenIds.length; i++) {
+            out[i] = decodeLogits(tokenIds[i], startIdx + i, kvMgr, bts);
+        }
+        return out;
+    }
+
     /** 模型配置 */
     ModelConfig config();
 

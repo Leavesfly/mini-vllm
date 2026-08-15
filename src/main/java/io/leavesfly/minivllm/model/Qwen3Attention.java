@@ -2,7 +2,6 @@ package io.leavesfly.minivllm.model;
 
 import io.leavesfly.minivllm.math.Matmul;
 import io.leavesfly.minivllm.math.RmsNorm;
-import io.leavesfly.minivllm.math.Softmax;
 import io.leavesfly.minivllm.memory.BlockTable;
 import io.leavesfly.minivllm.memory.KVCacheManager;
 
@@ -44,6 +43,8 @@ public final class Qwen3Attention {
      * 融合 QKV 投影权重（性能优化）：把 q/k/v 三个 Linear 的权重拼接为一个
      * [qDim+2*kvDim, dModel] 的大矩阵。decode 时一次 matVec 完成全部投影，
      * 将 3 次 fork-join 线程调度合并为 1 次，减少每层 ~2 次调度开销。
+     * mmap 权重不融合：拼接会把全量权重物化回堆内，违背“不落堆”初衷，
+     * 此时返回 null，decode 回退三次独立 matVecMapped（内存受限模式的合理代价）。
      */
     private final Linear fusedQKV;
     private final int qkvDim; // qDim + 2*kvDim
@@ -68,10 +69,26 @@ public final class Qwen3Attention {
         this.fusedQKV = buildFusedQKV();
     }
 
-    /** 拼接 q/k/v 权重为单个 Linear（支持 bf16/int8/f32 三种格式） */
+    /** 拼接 q/k/v 权重为单个 Linear（支持 bf16/int4/int8/f32 四种格式；mmap 不融合返回 null） */
     private Linear buildFusedQKV() {
         int in = qProj.inFeatures();
-        if (qProj.isBf16()) {
+        if (qProj.isMmapBf16()) {
+            return null; // 权重在映射视图里，拼接会物化回堆；decode 走三路独立投影
+        }
+        if (qProj.isInt4()) {
+            int group = qProj.int4Group();
+            int half = in / 2;              // 每行 packed 字节数
+            int groups = in / group;        // 每行分组数
+            byte[] w = new byte[qkvDim * half];
+            float[] s = new float[qkvDim * groups];
+            System.arraycopy(qProj.weightInt4(), 0, w, 0, qDim * half);
+            System.arraycopy(qProj.scaleInt4(), 0, s, 0, qDim * groups);
+            System.arraycopy(kProj.weightInt4(), 0, w, qDim * half, kvDim * half);
+            System.arraycopy(kProj.scaleInt4(), 0, s, qDim * groups, kvDim * groups);
+            System.arraycopy(vProj.weightInt4(), 0, w, (qDim + kvDim) * half, kvDim * half);
+            System.arraycopy(vProj.scaleInt4(), 0, s, (qDim + kvDim) * groups, kvDim * groups);
+            return Linear.ofInt4(w, s, group, in, qkvDim);
+        } else if (qProj.isBf16()) {
             short[] w = new short[qkvDim * in];
             System.arraycopy(qProj.weightBf16(), 0, w, 0, qDim * in);
             System.arraycopy(kProj.weightBf16(), 0, w, qDim * in, kvDim * in);
@@ -96,11 +113,11 @@ public final class Qwen3Attention {
         }
     }
 
-    /** 参数量（q/k/v/o 投影 + qk norm） */
+    /** 参数量（q/k/v/o 投影 + qk norm；qk norm 可空——Llama 等架构无此层） */
     public long numParameters() {
         return qProj.numParameters() + kProj.numParameters()
                 + vProj.numParameters() + oProj.numParameters()
-                + qNorm.numParameters() + kNorm.numParameters();
+                + (qNorm != null ? qNorm.numParameters() + kNorm.numParameters() : 0);
     }
 
     /**
@@ -130,14 +147,18 @@ public final class Qwen3Attention {
             kvMgr.writeKV(bt, pos, kt, vt);
         }
 
-        // 3. causal GQA attention（K/V 连续在手，直接算）
-        float[] out = causalAttention(q, k, v, seqLen);
+        // 3. causal GQA attention（FlashAttention 分块内核）：startIdx>0（前缀共享/分块
+        //    prefill）时前缀段从 BlockTable 分页读取，与 chunk 内 causal 段共享 online softmax
+        float[] out = new float[seqLen * qDim];
+        FlashAttention.causalPrefill(q, k, v, seqLen, startIdx, nHead, nKVHead, headDim,
+                kvMgr, bt, out);
         // 4. 输出投影 [seqLen, qDim] -> [seqLen, dModel]
         return oProj.forwardBatch(out, seqLen);
     }
 
     /**
      * 纯前向（无 KV cache）—— 供 PyTorch 风格 Qwen3Model.forward 使用。
+     * 与 prefill 共用同一套 FlashAttention 分块内核（无前缀段），保证数值路径一致。
      */
     public float[] forwardDense(float[] input, int seqLen) {
         float[] q = qProj.forwardBatch(input, seqLen);
@@ -146,7 +167,8 @@ public final class Qwen3Attention {
         for (int t = 0; t < seqLen; t++) {
             applyQkNormAndRope(q, t * qDim, k, t * kvDim, t);
         }
-        float[] out = causalAttention(q, k, v, seqLen);
+        float[] out = new float[seqLen * qDim];
+        FlashAttention.causalPrefill(q, k, v, seqLen, 0, nHead, nKVHead, headDim, null, null, out);
         return oProj.forwardBatch(out, seqLen);
     }
 
@@ -159,14 +181,23 @@ public final class Qwen3Attention {
      * @return [dModel] attention 输出
      */
     public float[] decodePaged(float[] hidden, int curIdx, KVCacheManager kvMgr, BlockTable bt) {
-        // 融合 QKV 投影：一次 matVec 得到 [qDim+2*kvDim]，切分出 q/k/v
-        float[] qkv = fusedQKV.forward(hidden);
-        float[] q = new float[qDim];
-        float[] k = new float[kvDim];
-        float[] v = new float[kvDim];
-        System.arraycopy(qkv, 0, q, 0, qDim);
-        System.arraycopy(qkv, qDim, k, 0, kvDim);
-        System.arraycopy(qkv, qDim + kvDim, v, 0, kvDim);
+        // 融合 QKV 投影：一次 matVec 得到 [qDim+2*kvDim]，切分出 q/k/v（mmap 模式回退三路）
+        float[] q;
+        float[] k;
+        float[] v;
+        if (fusedQKV != null) {
+            float[] qkv = fusedQKV.forward(hidden);
+            q = new float[qDim];
+            k = new float[kvDim];
+            v = new float[kvDim];
+            System.arraycopy(qkv, 0, q, 0, qDim);
+            System.arraycopy(qkv, qDim, k, 0, kvDim);
+            System.arraycopy(qkv, qDim + kvDim, v, 0, kvDim);
+        } else {
+            q = qProj.forward(hidden);
+            k = kProj.forward(hidden);
+            v = vProj.forward(hidden);
+        }
 
         applyQkNormAndRope(q, 0, k, 0, curIdx);
         kvMgr.writeKV(bt, curIdx, k, v);
@@ -189,16 +220,25 @@ public final class Qwen3Attention {
      */
     public float[] decodeBatch(float[] hidden, int batch, int[] curIdxs,
                                KVCacheManager kvMgr, BlockTable[] bts) {
-        // 融合 QKV 投影：一次 forwardBatch 得到 [B, qkvDim]，切分出 q/k/v
-        float[] qkvAll = fusedQKV.forwardBatch(hidden, batch); // [B, qkvDim]
-        float[] q = new float[batch * qDim];
-        float[] k = new float[batch * kvDim];
-        float[] v = new float[batch * kvDim];
-        for (int b = 0; b < batch; b++) {
-            int src = b * qkvDim;
-            System.arraycopy(qkvAll, src, q, b * qDim, qDim);
-            System.arraycopy(qkvAll, src + qDim, k, b * kvDim, kvDim);
-            System.arraycopy(qkvAll, src + qDim + kvDim, v, b * kvDim, kvDim);
+        // 融合 QKV 投影：一次 forwardBatch 得到 [B, qkvDim]，切分出 q/k/v（mmap 模式回退三路）
+        float[] q;
+        float[] k;
+        float[] v;
+        if (fusedQKV != null) {
+            float[] qkvAll = fusedQKV.forwardBatch(hidden, batch); // [B, qkvDim]
+            q = new float[batch * qDim];
+            k = new float[batch * kvDim];
+            v = new float[batch * kvDim];
+            for (int b = 0; b < batch; b++) {
+                int src = b * qkvDim;
+                System.arraycopy(qkvAll, src, q, b * qDim, qDim);
+                System.arraycopy(qkvAll, src + qDim, k, b * kvDim, kvDim);
+                System.arraycopy(qkvAll, src + qDim + kvDim, v, b * kvDim, kvDim);
+            }
+        } else {
+            q = qProj.forwardBatch(hidden, batch);
+            k = kProj.forwardBatch(hidden, batch);
+            v = vProj.forwardBatch(hidden, batch);
         }
         float[] kt = new float[kvDim];
         float[] vt = new float[kvDim];
@@ -231,12 +271,16 @@ public final class Qwen3Attention {
      *   3. 最终除以 sumExp 归一化
      *
      * 多头并行：各头写 out 的不同区间，无数据竞争；长上下文阈值降为 2 即并行。
+     *
+     * KV INT8 量化：kvMgr 为 int8 模式时，score 用 dotInt8（量化域点积×scale），
+     * V 累加用 axpyInt8，全程不反量化物化 f32——KV 带宽减半直接提速长上下文 decode。
      */
     private void pagedAttention(float[] q, int qBase, float[] out, int outBase,
                                int curIdx, KVCacheManager kvMgr, BlockTable bt) {
         int totalTokens = curIdx + 1;
         int nBlocks = bt.numBlocks();
         float invSqrt = 1f / (float) Math.sqrt(headDim);
+        final boolean int8 = kvMgr.isInt8();
 
         // 多头并行：各头写入 out 的不同 qOff 区间，无数据竞争
         Matmul.parallelRows(nHead, 2, h -> {
@@ -251,13 +295,20 @@ public final class Qwen3Attention {
 
             // 单遍扫描：逐 block、逐 token 同时计算 score 并累加 V
             for (int blk = 0; blk < nBlocks; blk++) {
-                float[] kBlk = kvMgr.blockK(bt, blk); // [blockSize, kvDim]
-                float[] vBlk = kvMgr.blockV(bt, blk); // [blockSize, kvDim]
+                java.nio.ByteBuffer kBuf = int8 ? null : kvMgr.blockK(bt, blk); // f32：堆外 [blockSize, kvDim]
+                java.nio.ByteBuffer vBuf = int8 ? null : kvMgr.blockV(bt, blk);
+                byte[] k8 = int8 ? kvMgr.blockK8(bt, blk) : null;   // int8：量化值
+                byte[] v8 = int8 ? kvMgr.blockV8(bt, blk) : null;
+                float[] kScale = int8 ? kvMgr.blockKScale(bt, blk) : null; // per-token scale
+                float[] vScale = int8 ? kvMgr.blockVScale(bt, blk) : null;
                 int remain = totalTokens - blk * blockSize;
                 int tokensInBlock = Math.min(blockSize, Math.max(0, remain));
                 for (int s = 0; s < tokensInBlock; s++) {
                     int kOff = s * kvDim + kvOff;
-                    float score = Matmul.dot(q, qOff, kBlk, kOff, headDim) * invSqrt;
+                    // 量化域点积 / 堆外点积：均无需把 K 物化到堆上数组
+                    float score = int8
+                            ? Matmul.dotInt8(k8, kOff, q, qOff, headDim, kScale[s]) * invSqrt
+                            : Matmul.dot(q, qOff, kBuf, kOff * 4, headDim) * invSqrt;
                     if (score > maxScore) {
                         // max 更新：修正已有累加（乘以 exp(oldMax - newMax)）
                         float correction = (float) Math.exp(maxScore - score);
@@ -269,9 +320,12 @@ public final class Qwen3Attention {
                     }
                     float w = (float) Math.exp(score - maxScore);
                     sumExp += w;
-                    // 加权 V 累加（SIMD axpy）
-                    int vOff = s * kvDim + kvOff;
-                    Matmul.axpy(w, vBlk, vOff, headOut, 0, headDim);
+                    // 加权 V 累加（SIMD axpy；int8 模式在量化域直接累加）
+                    if (int8) {
+                        Matmul.axpyInt8(w, v8, kOff, headOut, 0, headDim, vScale[s]);
+                    } else {
+                        Matmul.axpy(w, vBuf, kOff * 4, headOut, 0, headDim);
+                    }
                 }
             }
             // 归一化并写入 out
@@ -286,11 +340,13 @@ public final class Qwen3Attention {
 
     /** QK-Norm（按头）后接 RoPE（按位置 pos），q/k 就地修改 */
     private void applyQkNormAndRope(float[] q, int qBase, float[] k, int kBase, int pos) {
-        for (int h = 0; h < nHead; h++) {
-            qNorm.forwardInPlace(q, qBase + h * headDim);
-        }
-        for (int kh = 0; kh < nKVHead; kh++) {
-            kNorm.forwardInPlace(k, kBase + kh * headDim);
+        if (qNorm != null) { // Llama 等架构无 QK-Norm，跳过
+            for (int h = 0; h < nHead; h++) {
+                qNorm.forwardInPlace(q, qBase + h * headDim);
+            }
+            for (int kh = 0; kh < nKVHead; kh++) {
+                kNorm.forwardInPlace(k, kBase + kh * headDim);
+            }
         }
         for (int h = 0; h < nHead; h++) {
             rope.applyInPlace(q, qBase + h * headDim, pos);
@@ -300,33 +356,6 @@ public final class Qwen3Attention {
         }
     }
 
-    /**
-     * causal GQA 多头注意力核心。
-     * q: [seqLen, qDim]，k/v: [seqLen, kvDim] -> 返回 [seqLen, qDim]。
-     */
-    private float[] causalAttention(float[] q, float[] k, float[] v, int seqLen) {
-        float[] out = new float[seqLen * qDim];
-        float invSqrt = 1f / (float) Math.sqrt(headDim);
-        // 多头并行：各头写入 out 的不同 qOff 区间，无数据竞争；prefill 计算量大，阈值降到 2 即并行
-        Matmul.parallelRows(nHead, 2, h -> {
-            int qOff = h * headDim;
-            int kvOff = (h / group) * headDim;
-            for (int i = 0; i < seqLen; i++) {
-                int qi = i * qDim + qOff;
-                float[] scores = new float[i + 1];
-                for (int j = 0; j <= i; j++) {
-                    int kj = j * kvDim + kvOff;
-                    scores[j] = Matmul.dot(q, qi, k, kj, headDim) * invSqrt;
-                }
-                Softmax.softmaxInPlace(scores);
-                int oi = i * qDim + qOff;
-                for (int j = 0; j <= i; j++) {
-                    int vj = j * kvDim + kvOff;
-                    float w = scores[j];
-                    Matmul.axpy(w, v, vj, out, oi, headDim);
-                }
-            }
-        });
-        return out;
-    }
+    // 朴素两遍 causalAttention 与逐 query 的 causalAttentionWithPrefix 已被
+    // FlashAttention.causalPrefill 统一取代（分块 + online softmax，前缀段分页读取）。
 }

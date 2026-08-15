@@ -1,0 +1,32 @@
+{
+ "llama/single": {
+  "messages": [
+   {
+    "role": "user",
+    "content": "Hello"
+   }
+  ],
+  "expected": "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\nCutting Knowledge Date: December 2023\nToday Date: 13 Aug 2026\n\n<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nHello<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+ },
+ "llama/multi": {
+  "messages": [
+   {
+    "role": "system",
+    "content": "You are helpful."
+   },
+   {
+    "role": "user",
+    "content": "你好"
+   },
+   {
+    "role": "assistant",
+    "content": "你好！"
+   },
+   {
+    "role": "user",
+    "content": "1+1=?"
+   }
+  ],
+  "expected": "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\nCutting Knowledge Date: December 2023\nToday Date: 13 Aug 2026\n\nYou are helpful.<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n你好<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n你好！<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n1+1=?<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+ }
+}

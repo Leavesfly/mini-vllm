@@ -10,6 +10,7 @@ import org.junit.jupiter.api.Timeout;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.TimeUnit;
 
@@ -102,6 +103,85 @@ class LLMEngineE2ETest {
 
         assertEquals(copy(s1.outputTokens()), copy(s2.outputTokens()),
                 "greedy 解码在相同权重下应可复现（与采样随机种子无关）");
+    }
+
+    @Test
+    @Timeout(value = 60, unit = TimeUnit.SECONDS)
+    void int8KvCacheGreedyOutputMatchesF32() {
+        // KV cache INT8 量化（阶段 3）端到端：同权重下 greedy 生成序列应与 f32 一致
+        // （量化误差远小于相邻 logits 间距，argmax 不翻转）。
+        ModelConfig cfg = ModelConfig.small();
+        TransformerModel model1 = ModelLoader.randomInit(cfg);
+        TransformerModel model2 = ModelLoader.randomInit(cfg); // randomInit 固定 seed，权重相同
+        KVCacheManager kvF32 = new KVCacheManager(512, cfg.blockSize(), cfg.dModel());
+        KVCacheManager kvInt8 = new KVCacheManager(512, cfg.blockSize(), cfg.dModel(), true);
+        LLMEngine eF32 = new LLMEngine(model1, kvF32, new ByteTokenizer(), 2, new int[0], SEED);
+        LLMEngine eInt8 = new LLMEngine(model2, kvInt8, new ByteTokenizer(), 2, new int[0], SEED);
+
+        Sequence sF32 = eF32.addRequest("quantize my kv cache", greedy(12), null);
+        driveToCompletion(eF32);
+        Sequence sInt8 = eInt8.addRequest("quantize my kv cache", greedy(12), null);
+        driveToCompletion(eInt8);
+
+        assertTrue(sInt8.isFinished());
+        assertEquals(copy(sF32.outputTokens()), copy(sInt8.outputTokens()),
+                "INT8 KV cache 下 greedy 输出应与 f32 一致");
+    }
+
+    /** 小 KV 池引擎：逼出 preemption（两序列并发时池容不下全部 decode 增量） */
+    private static LLMEngine newTinyPoolEngine(ModelConfig cfg, TransformerModel model, int numBlocks) {
+        KVCacheManager kvMgr = new KVCacheManager(numBlocks, cfg.blockSize(), cfg.dModel());
+        return new LLMEngine(model, kvMgr, new ByteTokenizer(), 4, new int[0], SEED);
+    }
+
+    @Test
+    @Timeout(value = 120, unit = TimeUnit.SECONDS)
+    void preemptionRecomputeOutputMatchesUnpreemptedBaseline() {
+        // 阶段 4：小池 + 两并发长序列 → 触发抢占；recompute 后所有请求完成，
+        // 且 greedy 输出与宽松池基线完全一致（重算语义正确的最强验证）。
+        ModelConfig cfg = ModelConfig.small();
+        String prompt = "preempt me please ";
+        int maxTokens = 40;
+
+        // 基线：宽松池，无抢占
+        LLMEngine base = newEngine(cfg, 4, -1, SEED);
+        Sequence b1 = base.addRequest(prompt, greedy(maxTokens), null);
+        Sequence b2 = base.addRequest(prompt, greedy(maxTokens), null);
+        driveToCompletion(base);
+
+        // 小池：两序列并发 decode 增量超出池容量，必触发抢占
+        LLMEngine tiny = newTinyPoolEngine(cfg, ModelLoader.randomInit(cfg), 10);
+        Sequence t1 = tiny.addRequest(prompt, greedy(maxTokens), null);
+        Sequence t2 = tiny.addRequest(prompt, greedy(maxTokens), null);
+        driveToCompletion(tiny);
+
+        assertTrue(t1.isFinished() && t2.isFinished(), "小池下所有请求应最终完成");
+        assertEquals(Sequence.Stage.FINISHED, t1.stage());
+        assertEquals(Sequence.Stage.FINISHED, t2.stage());
+        assertEquals(maxTokens, t1.outputTokens().size());
+        assertEquals(maxTokens, t2.outputTokens().size());
+        assertTrue(t1.preemptCount() + t2.preemptCount() > 0, "本场景应至少触发一次抢占");
+        // recompute 正确性：与无抢占基线逐 token 一致
+        assertEquals(copy(b1.outputTokens()), copy(t1.outputTokens()), "抢占重算后输出与基线不一致（请求 1）");
+        assertEquals(copy(b2.outputTokens()), copy(t2.outputTokens()), "抢占重算后输出与基线不一致（请求 2）");
+    }
+
+    @Test
+    @Timeout(value = 120, unit = TimeUnit.SECONDS)
+    void manyRequestsAllCompleteUnderTinyKvPool() {
+        // 阶段 4：多长序列 + 小池，验证反复抢占无死循环、全部完成
+        ModelConfig cfg = ModelConfig.small();
+        LLMEngine tiny = newTinyPoolEngine(cfg, ModelLoader.randomInit(cfg), 10);
+        List<Sequence> seqs = new ArrayList<>();
+        String[] prompts = {"alpha request ", "beta request ", "gamma request ", "delta request "};
+        for (String p : prompts) {
+            seqs.add(tiny.addRequest(p, greedy(24), null));
+        }
+        driveToCompletion(tiny); // 内置 100 万步死循环保护
+        for (Sequence s : seqs) {
+            assertEquals(Sequence.Stage.FINISHED, s.stage(), "请求 " + s.id() + " 未完成");
+            assertEquals(24, s.outputTokens().size());
+        }
     }
 
     @Test
@@ -200,8 +280,107 @@ class LLMEngineE2ETest {
 
     @Test
     @Timeout(value = 60, unit = TimeUnit.SECONDS)
+    void prefixSharingProducesIdenticalGreedyOutput() {
+        // 同一 prompt 请求两次：第二次命中前缀共享（跳过部分 prefill），
+        // greedy 确定性下两次输出必须完全一致——验证共享路径数值正确。
+        ModelConfig cfg = ModelConfig.small();
+        TransformerModel model = ModelLoader.randomInit(cfg);
+        KVCacheManager kvMgr = new KVCacheManager(512, cfg.blockSize(), cfg.dModel());
+        LLMEngine engine = new LLMEngine(model, kvMgr, new ByteTokenizer(), 2, new int[0], SEED);
+        // > blockSize(16) 的 prompt 才会产生可共享的完整 block
+        String prompt = "The quick brown fox jumps over the lazy dog again and again";
+
+        Sequence s1 = engine.addRequest(prompt, greedy(10), null);
+        driveToCompletion(engine);
+        Sequence s2 = engine.addRequest(prompt, greedy(10), null);
+        driveToCompletion(engine);
+
+        assertEquals(copy(s1.outputTokens()), copy(s2.outputTokens()),
+                "命中前缀共享的请求应与不共享时输出完全一致");
+        // 两个请求都已释放，注册过的前缀转入缓存态（证明 registerPrefix 生效）
+        assertTrue(kvMgr.cachedBlocks() > 0, "完成请求的前缀 block 应留在缓存中供后续共享");
+    }
+
+    @Test
+    @Timeout(value = 60, unit = TimeUnit.SECONDS)
+    void longPrefillIsChunkedAcrossSteps() {
+        // tokenBudget=17：无 decode 时每步最多 prefill 17 token，
+        // 80 token 的 prompt 必须分多步完成（Chunked Prefill 不一次性阻塞）。
+        ModelConfig cfg = ModelConfig.small();
+        TransformerModel model = ModelLoader.randomInit(cfg);
+        KVCacheManager kvMgr = new KVCacheManager(512, cfg.blockSize(), cfg.dModel());
+        LLMEngine engine = new LLMEngine(model, kvMgr, new ByteTokenizer(), 2, 17,
+                new int[0], new DefaultSamplingStrategy(SEED), new EosMaxTokensCriteria(), new FifoPolicy());
+        String longPrompt = "This is a fairly long prompt that should be chunked into pieces!";
+
+        Sequence seq = engine.addRequest(longPrompt, greedy(4), null);
+        int promptLen = seq.promptTokens().length;
+        assertTrue(promptLen > 17, "测试前提：prompt 应超过单步预算");
+
+        engine.step(); // admit + 首个 chunk
+        assertEquals(Sequence.Stage.PREFILL, seq.stage(), "首步后应仍在分块 prefill 中");
+        assertTrue(seq.prefilledTokens() > 0 && seq.prefilledTokens() < promptLen,
+                "首步只应完成部分 prefill，实际=" + seq.prefilledTokens());
+
+        driveToCompletion(engine);
+        assertTrue(seq.isFinished());
+        assertEquals(4, seq.outputTokens().size());
+    }
+
+    @Test
+    @Timeout(value = 60, unit = TimeUnit.SECONDS)
+    void chunkedPrefillOutputMatchesOneShot() {
+        // 同一 prompt：大预算一步 prefill vs 小预算多步分块，greedy 输出必须完全一致
+        String prompt = "The quick brown fox jumps over the lazy dog again and again";
+        int maxTokens = 8;
+
+        LLMEngine oneShot = newEngine(ModelConfig.small(), 2, -1, SEED);
+        Sequence s1 = oneShot.addRequest(prompt, greedy(maxTokens), null);
+        driveToCompletion(oneShot);
+
+        ModelConfig cfg = ModelConfig.small();
+        TransformerModel model = ModelLoader.randomInit(cfg);
+        KVCacheManager kvMgr = new KVCacheManager(512, cfg.blockSize(), cfg.dModel());
+        LLMEngine chunked = new LLMEngine(model, kvMgr, new ByteTokenizer(), 2, 24,
+                new int[0], new DefaultSamplingStrategy(SEED), new EosMaxTokensCriteria(), new FifoPolicy());
+        Sequence s2 = chunked.addRequest(prompt, greedy(maxTokens), null);
+        driveToCompletion(chunked);
+
+        assertEquals(copy(s1.outputTokens()), copy(s2.outputTokens()),
+                "分块 prefill 与整段 prefill 的 greedy 输出应完全一致");
+    }
+
+    @Test
+    @Timeout(value = 60, unit = TimeUnit.SECONDS)
+    void decodeNotStarvedWhileLongPrefillChunks() {
+        // 已在 decode 的请求与长 prefill 共存：每步 decode 优先，两者都正常推进
+        ModelConfig cfg = ModelConfig.small();
+        TransformerModel model = ModelLoader.randomInit(cfg);
+        KVCacheManager kvMgr = new KVCacheManager(512, cfg.blockSize(), cfg.dModel());
+        LLMEngine engine = new LLMEngine(model, kvMgr, new ByteTokenizer(), 2, 24,
+                new int[0], new DefaultSamplingStrategy(SEED), new EosMaxTokensCriteria(), new FifoPolicy());
+
+        // 短请求先进入 decode，再提交长 prompt
+        Sequence shortSeq = engine.addRequest("hi", greedy(12), null);
+        for (int i = 0; i < 3; i++) engine.step(); // 短请求完成 prefill 并 decode 几步
+        assertEquals(Sequence.Stage.DECODE, shortSeq.stage());
+
+        Sequence longSeq = engine.addRequest(
+                "a much longer prompt that needs multiple prefill chunks to finish processing", greedy(4), null);
+        int shortBefore = shortSeq.outputTokens().size();
+        for (int i = 0; i < 3; i++) engine.step();
+        assertTrue(shortSeq.outputTokens().size() > shortBefore,
+                "长 prefill 分块期间，decode 请求应持续推进不被阻塞");
+
+        driveToCompletion(engine);
+        assertTrue(shortSeq.isFinished() && longSeq.isFinished());
+    }
+
+    @Test
+    @Timeout(value = 60, unit = TimeUnit.SECONDS)
     void asyncServiceModeProcessesRequest() throws InterruptedException {
         // 服务模式：后台线程持续 step，验证 start()/addRequest()/stop() 全链路
+        // （引擎空闲时阻塞在信号量上，addRequest 唤醒——本测试即验证事件唤醒路径）
         LLMEngine engine = newEngine(ModelConfig.small(), 4, -1, SEED);
         engine.start();
         try {
@@ -219,5 +398,92 @@ class LLMEngineE2ETest {
         } finally {
             engine.stop();
         }
+    }
+
+    // ========== 阶段五：指标与请求取消 ==========
+
+    @Test
+    @Timeout(value = 30, unit = TimeUnit.SECONDS)
+    void metricsRecordGenerationStats() {
+        LLMEngine engine = newEngine(ModelConfig.small(), 2, -1, SEED);
+        engine.addRequest("metrics please", greedy(6), null);
+        driveToCompletion(engine);
+
+        Map<String, Object> snap = engine.metricsSnapshot();
+        assertEquals(6L, ((Number) snap.get("generated_tokens")).longValue());
+        assertEquals(1L, ((Number) snap.get("finished_requests")).longValue());
+        assertTrue((Double) snap.get("avg_ttft_ms") > 0, "TTFT 应被打点（>0）");
+        assertTrue((Double) snap.get("avg_itl_ms") > 0, "ITL 应被打点（>0）");
+        assertEquals(0, ((Number) snap.get("running")).intValue());
+        assertEquals(0, ((Number) snap.get("waiting")).intValue());
+        assertTrue((Double) snap.get("throughput_tok_per_sec") > 0);
+    }
+
+    @Test
+    @Timeout(value = 120, unit = TimeUnit.SECONDS)
+    void preemptionsAreCountedInMetrics() {
+        // 小池触发抢占（复用阶段 4 场景）：指标中 preemptions 应 > 0
+        ModelConfig cfg = ModelConfig.small();
+        LLMEngine tiny = newTinyPoolEngine(cfg, ModelLoader.randomInit(cfg), 10);
+        tiny.addRequest("alpha request ", greedy(24), null);
+        tiny.addRequest("beta request ", greedy(24), null);
+        driveToCompletion(tiny);
+        assertTrue(((Number) tiny.metricsSnapshot().get("preemptions")).longValue() > 0,
+                "小池场景应触发过抢占且被计入指标");
+    }
+
+    @Test
+    @Timeout(value = 30, unit = TimeUnit.SECONDS)
+    void cancelledWaitingRequestIsAborted() {
+        LLMEngine engine = newEngine(ModelConfig.small(), 2, -1, SEED);
+        Sequence seq = engine.addRequest("cancel me", greedy(8), null);
+        seq.cancel(); // 尚未 admit，仍在 waiting
+        engine.step();
+        assertEquals(Sequence.Stage.ABORTED, seq.stage());
+        assertTrue(seq.isFinished());
+        assertEquals(0, engine.scheduler().runningCount());
+        assertEquals(0, engine.scheduler().waitingCount());
+    }
+
+    @Test
+    @Timeout(value = 30, unit = TimeUnit.SECONDS)
+    void cancelledRunningRequestReleasesKv() {
+        ModelConfig cfg = ModelConfig.small();
+        TransformerModel model = ModelLoader.randomInit(cfg);
+        KVCacheManager kvMgr = new KVCacheManager(512, cfg.blockSize(), cfg.dModel());
+        LLMEngine engine = new LLMEngine(model, kvMgr, new ByteTokenizer(), 2, new int[0], SEED);
+        int freeInitial = kvMgr.freeBlocks();
+
+        Sequence seq = engine.addRequest("cancel me mid decode", greedy(100), null);
+        engine.step(); // prefill 完成并进入 decode
+        assertEquals(Sequence.Stage.DECODE, seq.stage());
+        assertTrue(kvMgr.freeBlocks() < freeInitial, "decode 中应已占用 KV block");
+
+        seq.cancel();
+        engine.step(); // 清扫：ABORT + 释放
+        assertEquals(Sequence.Stage.ABORTED, seq.stage());
+        assertTrue(seq.isFinished());
+        // 释放后 block 回到空闲或前缀缓存态（prefill 完成时已注册），总量守恒
+        assertEquals(freeInitial, kvMgr.freeBlocks() + kvMgr.cachedBlocks(),
+                "取消后 KV block 应全部释放（空闲 + 缓存态）");
+    }
+
+    @Test
+    @Timeout(value = 30, unit = TimeUnit.SECONDS)
+    void requestTooBigForPoolAbortsInsteadOfLivelock() {
+        // 回归：池容不下单个请求且无在跑序列可释放时，必须 ABORT 而非永远留在
+        // waiting 空转（旧行为下 step 无限循环、generate 死锁）
+        ModelConfig cfg = ModelConfig.small();
+        TransformerModel model = ModelLoader.randomInit(cfg);
+        // 仅 1 个 block（容量 = blockSize 个 token），装不下 2*blockSize 的 prompt
+        KVCacheManager kvMgr = new KVCacheManager(1, cfg.blockSize(), cfg.dModel());
+        LLMEngine engine = new LLMEngine(model, kvMgr, new ByteTokenizer(), 2, new int[0], SEED);
+
+        Sequence seq = engine.addRequest("x".repeat(cfg.blockSize() * 2), greedy(4), null);
+        engine.step();
+        assertEquals(Sequence.Stage.ABORTED, seq.stage());
+        assertTrue(seq.isFinished());
+        assertFalse(engine.scheduler().hasWork(), "ABORT 后不应残留待办工作");
+        assertEquals(1, kvMgr.freeBlocks());
     }
 }

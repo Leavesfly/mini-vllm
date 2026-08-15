@@ -56,12 +56,12 @@ class Qwen3AlignmentTest {
         assumeTrue(Boolean.parseBoolean(System.getProperty("qwen3.align", "false")),
                 "未指定 -Dqwen3.align=true，跳过对齐测试");
         modelDir = resolveModelDir();
-        assumeTrue(modelDir != null && Files.exists(modelDir.resolve("model.safetensors")),
+        assumeTrue(modelDir != null && Files.exists(modelDir.resolve("config.json")),
                 "未找到 Qwen3-0.6B 模型目录");
         cfg = ModelConfig.fromConfigJson(SimpleJson.parseObject(
                 Files.readString(modelDir.resolve("config.json"))));
         cfg.maxSeqLen(2048);
-        Map<String, float[]> weights = SafetensorsLoader.load(modelDir.resolve("model.safetensors"));
+        Map<String, float[]> weights = SafetensorsLoader.loadDir(modelDir); // 单文件/多分片自适应
         model = Qwen3Loader.load(cfg, weights);
     }
 

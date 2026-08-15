@@ -46,13 +46,26 @@ public final class SwiGluFfn {
     /**
      * 批量前向：x[seqLen, dModel] -> y[seqLen, dModel]。
      * gate+up 融合：按输出通道并行，每个权重行只读一次并复用到全部 m 个输入行。
+     * 量化权重（int4/int8）先把本通道行反量化为 f32（每通道一次），再逐输入行 f32 点积——
+     * 否则解包链对每个输入行重复执行，大 chunk prefill 下成为主要开销（见 Linear.forwardBatch）。
      */
     public float[] forwardBatch(float[] x, int seqLen) {
         int dFfn = gate.outFeatures();
         int in = gate.inFeatures();
         float[] g = new float[seqLen * dFfn];
+        boolean quant = gate.isInt4() || gate.isInt8();
 
         Matmul.parallelRows(dFfn, o -> {
+            if (quant) {
+                float[] gRow = gate.dequantRow(o);
+                float[] uRow = up.dequantRow(o);
+                for (int i = 0; i < seqLen; i++) {
+                    int xOff = i * in;
+                    g[i * dFfn + o] = Silu.silu(Matmul.dot(gRow, 0, x, xOff, in))
+                            * Matmul.dot(uRow, 0, x, xOff, in);
+                }
+                return;
+            }
             for (int i = 0; i < seqLen; i++) {
                 int xOff = i * in;
                 float gv = gate.dotRow(x, xOff, o);

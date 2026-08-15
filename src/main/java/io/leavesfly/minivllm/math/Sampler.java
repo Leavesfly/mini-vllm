@@ -20,6 +20,7 @@ public final class Sampler {
     private float temperature = 1.0f;
     private int topK = 0;      // 0 表示不限制
     private float topP = 1.0f; // 1.0 表示不限制
+    private float minP = 0.0f; // 0 表示不启用：概率 < maxProb×minP 的 token 被滤掉
 
     public Sampler(long seed) {
         this.random = new Random(seed);
@@ -27,9 +28,15 @@ public final class Sampler {
 
     /** 配置采样参数（由引擎在每次采样前调用） */
     public void configure(float temperature, int topK, float topP) {
+        configure(temperature, topK, topP, 0.0f);
+    }
+
+    /** 配置采样参数（含 min-p） */
+    public void configure(float temperature, int topK, float topP, float minP) {
         this.temperature = temperature;
         this.topK = topK;
         this.topP = topP;
+        this.minP = minP;
     }
 
     /** greedy：返回最大 logits 的下标 */
@@ -46,10 +53,10 @@ public final class Sampler {
     }
 
     /**
-     * 完整采样流程：temperature → top-k → top-p → 多项采样。
+     * 完整采样流程：min-p → temperature → top-k → top-p → 多项采样。
      *
      * 性能要点（词表 151936 时必须考虑）：
-     * - 无截断（topK=0 且 topP>=1）时直接全词表多项采样，O(n) 无需排序；
+     * - 无截断（topK=0 且 topP>=1 且 minP=0）时直接全词表多项采样，O(n) 无需排序；
      * - 有截断时用大小为 k 的最小堆做 top-k 选择，O(n log k)，
      *   避免对 15 万元素做全排序（原插入排序 O(n²) 在大词表下不可用）。
      *
@@ -63,10 +70,28 @@ public final class Sampler {
 
         float[] probs = Softmax.softmaxWithTemp(logits, temperature);
         int n = probs.length;
+
+        // min-p：以最大概率为基准滤掉长尾（对照 vLLM min_p）；
+        // 就地置零后走下方通用的堆选择/截断路径
+        if (minP > 0f) {
+            float maxProb = 0f;
+            for (float p : probs) {
+                if (p > maxProb) {
+                    maxProb = p;
+                }
+            }
+            float threshold = maxProb * minP;
+            for (int i = 0; i < n; i++) {
+                if (probs[i] < threshold) {
+                    probs[i] = 0f;
+                }
+            }
+        }
+
         int k = topK > 0 ? Math.min(topK, n) : n;
 
         if (k == n && topP >= 1f) {
-            // 无截断：全词表多项采样
+            // 无截断：全词表多项采样（min-p 置零的项对 sum/cum 无贡献，同样正确）
             float sum = 0f;
             for (float p : probs) {
                 sum += p;

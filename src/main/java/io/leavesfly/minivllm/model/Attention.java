@@ -95,8 +95,11 @@ public final class Attention {
             kvMgr.writeKV(bt, startIdx + t, kt, vt);
         }
 
-        // 3. causal（可选局部带状 sparse）self-attention（此时 K/V 连续在手，直接算最高效）
-        float[] out = causalAttention(q, k, v, seqLen);
+        // 3. causal（可选局部带状 sparse）self-attention：startIdx>0（前缀共享/分块 prefill）时，
+        //    query 还需注意 BlockTable 中已缓存的历史 KV，走融合路径
+        float[] out = startIdx > 0
+                ? causalAttentionWithPrefix(q, k, v, seqLen, startIdx, kvMgr, bt)
+                : causalAttention(q, k, v, seqLen);
         // 4. 输出投影
         return oProj.forwardBatch(out, seqLen);
     }
@@ -128,6 +131,95 @@ public final class Attention {
                     for (int d = 0; d < headDim; d++) {
                         out[oOff + d] += w * v[vOff + d];
                     }
+                }
+            }
+        }
+        return out;
+    }
+
+    /**
+     * 带缓存前缀的 causal 多头注意力（前缀共享 / 分块 prefill 专用）。
+     *
+     * query i（全局位置 startIdx+i）需注意两部分 KV：
+     *   1. 已缓存前缀：BlockTable 中位置 0..startIdx-1 的 KV（逐 block 分页读取）
+     *   2. chunk 内 causal：本 chunk 位置 0..i 的连续 KV
+     * 两部分用 Online Softmax 融合为单遍扫描；sparse 层的窗口约束与
+     * {@link #causalAttention} 一致（query 仅看最近 window 个 token）。
+     */
+    private float[] causalAttentionWithPrefix(float[] q, float[] k, float[] v, int seqLen,
+                                              int startIdx, KVCacheManager kvMgr, BlockTable bt) {
+        float[] out = new float[seqLen * dModel];
+        float invSqrt = 1f / (float) Math.sqrt(headDim);
+        final boolean int8 = kvMgr.isInt8();
+        for (int h = 0; h < nHead; h++) {
+            int hOff = h * headDim;
+            for (int i = 0; i < seqLen; i++) {
+                int globalPos = startIdx + i;
+                int lo = sparse ? Math.max(0, globalPos - window + 1) : 0;
+                int qOff = i * dModel + hOff;
+
+                // Online Softmax 状态
+                float maxScore = Float.NEGATIVE_INFINITY;
+                float sumExp = 0f;
+                float[] acc = new float[headDim];
+
+                // 1. 已缓存前缀（0..startIdx-1）：逐 block、逐 token 扫描，窗口外跳过
+                int nBlocks = startIdx / blockSize + (startIdx % blockSize == 0 ? 0 : 1);
+                for (int blk = 0; blk < nBlocks; blk++) {
+                    java.nio.ByteBuffer kBuf = int8 ? null : kvMgr.blockK(bt, blk);
+                    java.nio.ByteBuffer vBuf = int8 ? null : kvMgr.blockV(bt, blk);
+                    byte[] k8 = int8 ? kvMgr.blockK8(bt, blk) : null;
+                    byte[] v8 = int8 ? kvMgr.blockV8(bt, blk) : null;
+                    float[] kScale = int8 ? kvMgr.blockKScale(bt, blk) : null;
+                    float[] vScale = int8 ? kvMgr.blockVScale(bt, blk) : null;
+                    int slots = Math.min(blockSize, startIdx - blk * blockSize);
+                    for (int s = 0; s < slots; s++) {
+                        int gid = blk * blockSize + s;
+                        if (gid < lo) continue;
+                        int off = s * dModel + hOff;
+                        // INT8 模式：量化域点积×scale，与反量化后点积等价（up to 量化误差）
+                        float score = int8
+                                ? Matmul.dotInt8(k8, off, q, qOff, headDim, kScale[s]) * invSqrt
+                                : Matmul.dot(q, qOff, kBuf, off * 4, headDim) * invSqrt;
+                        if (score > maxScore) {
+                            float correction = (float) Math.exp(maxScore - score);
+                            sumExp *= correction;
+                            for (int d = 0; d < headDim; d++) {
+                                acc[d] *= correction;
+                            }
+                            maxScore = score;
+                        }
+                        float w = (float) Math.exp(score - maxScore);
+                        sumExp += w;
+                        if (int8) {
+                            Matmul.axpyInt8(w, v8, off, acc, 0, headDim, vScale[s]);
+                        } else {
+                            Matmul.axpy(w, vBuf, off * 4, acc, 0, headDim);
+                        }
+                    }
+                }
+                // 2. chunk 内 causal（本地连续 KV）
+                int jFrom = Math.max(lo - startIdx, 0);
+                for (int j = jFrom; j <= i; j++) {
+                    int kj = j * dModel + hOff;
+                    float score = Matmul.dot(q, qOff, k, kj, headDim) * invSqrt;
+                    if (score > maxScore) {
+                        float correction = (float) Math.exp(maxScore - score);
+                        sumExp *= correction;
+                        for (int d = 0; d < headDim; d++) {
+                            acc[d] *= correction;
+                        }
+                        maxScore = score;
+                    }
+                    float w = (float) Math.exp(score - maxScore);
+                    sumExp += w;
+                    Matmul.axpy(w, v, kj, acc, 0, headDim);
+                }
+                // 归一化写出
+                float invSum = 1f / sumExp;
+                int oOff = i * dModel + hOff;
+                for (int d = 0; d < headDim; d++) {
+                    out[oOff + d] = acc[d] * invSum;
                 }
             }
         }
@@ -174,26 +266,33 @@ public final class Attention {
         int nValid = totalTokens - lo;
         float invSqrt = 1f / (float) Math.sqrt(headDim);
         float[] out = new float[dModel];
+        final boolean int8 = kvMgr.isInt8();
 
         for (int h = 0; h < nHead; h++) {
             int hOff = h * headDim;
             // 第一遍：逐 block 累加窗口内历史 token 的 attention scores
             float[] scores = new float[nValid];
             for (int b = 0; b < nBlocks; b++) {
-                float[] kBlk = kvMgr.blockK(bt, b); // [blockSize, dModel]
+                java.nio.ByteBuffer kBuf = int8 ? null : kvMgr.blockK(bt, b); // f32：堆外 [blockSize, dModel]
+                byte[] k8 = int8 ? kvMgr.blockK8(bt, b) : null;   // int8：量化值
+                float[] kScale = int8 ? kvMgr.blockKScale(bt, b) : null;
                 int remain = totalTokens - b * blockSize;
                 int tokensInBlock = Math.min(blockSize, Math.max(0, remain));
                 for (int s = 0; s < tokensInBlock; s++) {
                     int gid = b * blockSize + s; // 该 token 的全局下标
                     if (gid < lo) continue;      // 稀疏窗口外，跳过
                     int kOff = s * dModel + hOff;
-                    scores[gid - lo] = Matmul.dot(q, hOff, kBlk, kOff, headDim) * invSqrt;
+                    scores[gid - lo] = int8
+                            ? Matmul.dotInt8(k8, kOff, q, hOff, headDim, kScale[s]) * invSqrt
+                            : Matmul.dot(q, hOff, kBuf, kOff * 4, headDim) * invSqrt;
                 }
             }
             Softmax.softmaxInPlace(scores);
-            // 第二遍：逐 block 加权 V 累加输出
+            // 第二遍：逐 block 加权 V 累加输出（int8 模式在量化域直接累加）
             for (int b = 0; b < nBlocks; b++) {
-                float[] vBlk = kvMgr.blockV(bt, b);
+                java.nio.ByteBuffer vBuf = int8 ? null : kvMgr.blockV(bt, b);
+                byte[] v8 = int8 ? kvMgr.blockV8(bt, b) : null;
+                float[] vScale = int8 ? kvMgr.blockVScale(bt, b) : null;
                 int remain = totalTokens - b * blockSize;
                 int tokensInBlock = Math.min(blockSize, Math.max(0, remain));
                 for (int s = 0; s < tokensInBlock; s++) {
@@ -201,8 +300,10 @@ public final class Attention {
                     if (gid < lo) continue;
                     int vOff = s * dModel + hOff;
                     float w = scores[gid - lo];
-                    for (int d = 0; d < headDim; d++) {
-                        out[hOff + d] += w * vBlk[vOff + d];
+                    if (int8) {
+                        Matmul.axpyInt8(w, v8, vOff, out, hOff, headDim, vScale[s]);
+                    } else {
+                        Matmul.axpy(w, vBuf, vOff * 4, out, hOff, headDim);
                     }
                 }
             }
@@ -224,20 +325,38 @@ public final class Attention {
         kvMgr.writeKV(bt, curIdx, k, v);
 
         int totalTokens = curIdx + 1;
-        // gather 散落 block 的 K/V 成连续数组
+        // gather 散落 block 的 K/V 成连续数组（INT8 模式逐行反量化，学习对照路径）
         float[] kAll = new float[totalTokens * dModel];
         float[] vAll = new float[totalTokens * dModel];
         int idx = 0;
         int nBlocks = bt.numBlocks();
+        final boolean int8 = kvMgr.isInt8();
         for (int b = 0; b < nBlocks; b++) {
-            float[] kBlk = kvMgr.blockK(bt, b);
-            float[] vBlk = kvMgr.blockV(bt, b);
             int remain = totalTokens - b * blockSize;
             int tokensInBlock = Math.min(blockSize, Math.max(0, remain));
-            for (int s = 0; s < tokensInBlock; s++) {
-                System.arraycopy(kBlk, s * dModel, kAll, idx * dModel, dModel);
-                System.arraycopy(vBlk, s * dModel, vAll, idx * dModel, dModel);
-                idx++;
+            if (int8) {
+                byte[] k8 = kvMgr.blockK8(bt, b);
+                byte[] v8 = kvMgr.blockV8(bt, b);
+                float[] kScale = kvMgr.blockKScale(bt, b);
+                float[] vScale = kvMgr.blockVScale(bt, b);
+                for (int s = 0; s < tokensInBlock; s++) {
+                    for (int d = 0; d < dModel; d++) {
+                        kAll[idx * dModel + d] = k8[s * dModel + d] * kScale[s];
+                        vAll[idx * dModel + d] = v8[s * dModel + d] * vScale[s];
+                    }
+                    idx++;
+                }
+            } else {
+                java.nio.ByteBuffer kBuf = kvMgr.blockK(bt, b);
+                java.nio.ByteBuffer vBuf = kvMgr.blockV(bt, b);
+                for (int s = 0; s < tokensInBlock; s++) {
+                    int byteOff = s * dModel * 4;
+                    for (int d = 0; d < dModel; d++) {
+                        kAll[idx * dModel + d] = kBuf.getFloat(byteOff + d * 4);
+                        vAll[idx * dModel + d] = vBuf.getFloat(byteOff + d * 4);
+                    }
+                    idx++;
+                }
             }
         }
         // 标准 attention（decode 时当前 token 可见全部历史；sparse 层限制在最近 window 个）

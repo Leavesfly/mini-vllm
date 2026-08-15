@@ -1,5 +1,6 @@
 package io.leavesfly.minivllm.math;
 
+import java.nio.ShortBuffer;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.ExecutorService;
@@ -109,11 +110,46 @@ public final class Matmul {
     }
 
     /**
+     * 公共 INT4 点积入口（per-group 对称量化，Q4_0 风格打包）。
+     * w 为 packed 4-bit 权重（每字节两元素，wOff 为字节偏移），scales 为 per-group 缩放因子，
+     * sOff 为该权重行在 scales 中的起始组下标。要求 len % groupSize == 0。
+     * 权重仅 0.5 字节/元素，带宽为 int8 的一半。
+     */
+    public static float dotInt4(byte[] w, int wOff, float[] x, int xOff, int len,
+                                float[] scales, int sOff, int groupSize) {
+        return KERNEL.dotInt4(w, wOff, x, xOff, len, scales, sOff, groupSize);
+    }
+
+    /**
      * 加权累加：dst[dOff+i] += w * src[sOff+i]。
      * 用于 attention 的 V 加权求和，SIMD 向量化实现。
      */
     public static void axpy(float w, float[] src, int sOff, float[] dst, int dOff, int len) {
         KERNEL.axpy(w, src, sOff, dst, dOff, len);
+    }
+
+    /**
+     * 堆外点积入口：a 为堆上 f32 激活，b 为 direct ByteBuffer（堆外 KV block），
+     * bByteOff 为字节偏移（= 元素下标 × 4）。与 {@link #dot} 算术等价。
+     */
+    public static float dot(float[] a, int aOff, java.nio.ByteBuffer b, int bByteOff, int len) {
+        return KERNEL.dotOffHeap(a, aOff, b, bByteOff, len);
+    }
+
+    /**
+     * 堆外加权累加入口：dst[dOff+i] += w * src 第 (sByteOff+i*4) 字节处的 float。
+     * KV cache 堆外化后 attention 的 V 加权求和直接读堆外数据，无需拷回堆上。
+     */
+    public static void axpy(float w, java.nio.ByteBuffer src, int sByteOff, float[] dst, int dOff, int len) {
+        KERNEL.axpyOffHeap(w, src, sByteOff, dst, dOff, len);
+    }
+
+    /**
+     * INT8 量化行的加权累加：dst[dOff+i] += w * scale * src[sOff+i]，src 为 signed byte。
+     * KV cache INT8 量化后在量化域直接做 V 加权求和，避免整行反量化物化为 f32。
+     */
+    public static void axpyInt8(float w, byte[] src, int sOff, float[] dst, int dOff, int len, float scale) {
+        KERNEL.axpyInt8(w, src, sOff, dst, dOff, len, scale);
     }
 
     /**
@@ -243,6 +279,43 @@ public final class Matmul {
         return y;
     }
 
+    // ─── mmap 权重内核：行拷贝 + 复用 SIMD 点积 ───
+
+    /**
+     * 线程私有行缓冲（只增不缩）：mmap 权重每次点积前把一行 bulk 读进此缓冲，
+     * 再走堆内 SIMD 内核。避免逐行分配 short[] 的 GC 压力。
+     * 约束：调用方必须在下次取用前消费完本次写入（禁止嵌套复用）。
+     */
+    private static final ThreadLocal<short[]> MMAP_ROW_BUF = ThreadLocal.withInitial(() -> new short[0]);
+
+    /** 取线程私有行缓冲（容量不足时扩容），供 mmap 路径“读一行、复用多次”的场景 */
+    public static short[] mmapRowBuffer(int minLen) {
+        short[] buf = MMAP_ROW_BUF.get();
+        if (buf.length < minLen) {
+            buf = new short[minLen];
+            MMAP_ROW_BUF.set(buf);
+        }
+        return buf;
+    }
+
+    /**
+     * mmap bf16 权重行与 f32 激活的点积：与 {@link #dotBf16} 算术完全一致，
+     * 仅权重来源从堆内 short[] 换成映射视图——bulk 读行进线程私有缓冲后转调 SIMD 内核。
+     * 绝对位置 get 不移动 position，多线程可并发直读同一视图。
+     */
+    public static float dotBf16Mapped(ShortBuffer w, int wOff, float[] x, int xOff, int len) {
+        short[] row = mmapRowBuffer(len);
+        w.get(wOff, row, 0, len);
+        return KERNEL.dotBf16(row, 0, x, xOff, len);
+    }
+
+    /** mmap bf16 权重版矩阵与向量乘：结构同 {@link #matVecBf16}，权重来自映射视图 */
+    public static float[] matVecBf16Mapped(ShortBuffer w, float[] x, int m, int k) {
+        float[] y = new float[m];
+        parallelRows(m, i -> y[i] = dotBf16Mapped(w, i * k, x, 0, k));
+        return y;
+    }
+
     /**
      * INT8 量化权重版矩阵与向量乘：y(m) = W(m,k) · x(k)。
      * W 为 signed byte 行优先 [m,k]，scale[m] 为每行缩放因子。
@@ -251,6 +324,20 @@ public final class Matmul {
     public static float[] matVecInt8(byte[] w, float[] scale, float[] x, int m, int k) {
         float[] y = new float[m];
         parallelRows(m, i -> y[i] = KERNEL.dotInt8(w, i * k, x, 0, k, scale[i]));
+        return y;
+    }
+
+    /**
+     * INT4 量化权重版矩阵与向量乘：y(m) = W(m,k) · x(k)。
+     * W 为 packed 4-bit 行优先（每行 k/2 字节），scales 为 per-group 因子 [m * (k/groupSize)]。
+     * 带宽为 int8 的一半，decode 理论再提速近 2×。要求 k % groupSize == 0。
+     */
+    public static float[] matVecInt4(byte[] w, float[] scales, float[] x, int m, int k, int groupSize) {
+        float[] y = new float[m];
+        int groupsPerRow = k / groupSize;
+        int packedRowBytes = k / 2;
+        parallelRows(m, i -> y[i] = KERNEL.dotInt4(w, i * packedRowBytes, x, 0, k,
+                scales, i * groupsPerRow, groupSize));
         return y;
     }
 }

@@ -6,6 +6,7 @@ import io.leavesfly.minivllm.memory.BlockTable;
 import io.leavesfly.minivllm.memory.KVCacheManager;
 import org.junit.jupiter.api.Test;
 
+import java.util.Arrays;
 import java.util.Random;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
@@ -82,6 +83,43 @@ class Qwen3ModelTest {
     }
 
     @Test
+    void prefillWithCachedPrefixMatchesFullPrefill() {
+        // 分块 prefill（前缀共享/Chunked Prefill 的数值基础）：
+        // 分块前向 + startIdx>0 的带前缀注意力，必须与整段 prefill 数值一致。
+        ModelConfig cfg = tinyQwen3();
+        Qwen3Model model = randomQwen3(cfg, 42L);
+        int[] ids = {3, 1, 4, 1, 5, 9, 2, 6, 5, 3}; // 10 tokens，blockSize=4
+
+        // 路径 A：整段 prefill
+        KVCacheManager kvA = newKvMgr(cfg);
+        BlockTable[] btsA = newBlockTables(cfg);
+        ensureCapacity(kvA, btsA, ids.length);
+        float[] full = model.prefillLogits(ids, kvA, btsA, 0);
+
+        // 路径 B：块对齐切分 4 + 6（前 4 个 token 相当于前缀缓存命中）
+        KVCacheManager kvB = newKvMgr(cfg);
+        BlockTable[] btsB = newBlockTables(cfg);
+        ensureCapacity(kvB, btsB, ids.length);
+        model.prefillLogits(Arrays.copyOfRange(ids, 0, 4), kvB, btsB, 0);
+        float[] inc = model.prefillLogits(Arrays.copyOfRange(ids, 4, 10), kvB, btsB, 4);
+        assertArrayEquals(full, inc, 1e-4f, "块对齐分块 prefill 与整段不一致");
+
+        // 路径 C：非块对齐切分 5 + 2 + 3（startIdx 不在 block 边界，验证部分块扫描）
+        KVCacheManager kvC = newKvMgr(cfg);
+        BlockTable[] btsC = newBlockTables(cfg);
+        ensureCapacity(kvC, btsC, ids.length);
+        model.prefillLogits(Arrays.copyOfRange(ids, 0, 5), kvC, btsC, 0);
+        model.prefillLogits(Arrays.copyOfRange(ids, 5, 7), kvC, btsC, 5);
+        float[] inc2 = model.prefillLogits(Arrays.copyOfRange(ids, 7, 10), kvC, btsC, 7);
+        assertArrayEquals(full, inc2, 1e-4f, "非块对齐分块 prefill 与整段不一致");
+
+        // 分块路径写入的 KV cache 与整段路径一致：后续 decode 对齐
+        float[] dec = model.decodeLogits(8, ids.length, kvC, btsC);
+        float[] decRef = model.decodeLogits(8, ids.length, kvA, btsA);
+        assertArrayEquals(decRef, dec, 1e-4f, "分块 prefill 后的 decode 与整段不一致");
+    }
+
+    @Test
     void gqaSharesKvHeadsWithinGroup() {
         // nHead=2, nKVHead=1, headDim=4, dModel=8：两个 Q 头共享同一个 KV 头。
         // 把 qProj 的两个头行设为相同 -> 两个头的 attention 输出必须完全相同。
@@ -143,6 +181,55 @@ class Qwen3ModelTest {
             maxDiff = Math.max(maxDiff, Math.abs(ab[i] - ba[i]));
         }
         assertTrue(maxDiff > 1e-3f, "[a,b] 与 [b,a] 的最后位置 logits 应不同");
+    }
+
+    @Test
+    void int8KvCacheLogitsStayCloseToF32() {
+        // KV INT8 量化（阶段 3）：量化域计算引入的误差必须受控——
+        // prefill / 带前缀分块 prefill / decode 三条路径的 logits 与 f32 基线
+        // 平均绝对误差 < 1e-2（对照 vLLM kv_cache_dtype=int8 的精度表现）。
+        ModelConfig cfg = tinyQwen3();
+        Qwen3Model model = randomQwen3(cfg, 42L);
+        int[] ids = {3, 1, 4, 1, 5, 9, 2, 6, 5, 3};
+
+        // f32 基线：整段 prefill + 一步 decode
+        KVCacheManager kvF = newKvMgr(cfg);
+        BlockTable[] btsF = newBlockTables(cfg);
+        ensureCapacity(kvF, btsF, ids.length + 1);
+        float[] prefillF = model.prefillLogits(ids, kvF, btsF, 0);
+        float[] decodeF = model.decodeLogits(8, ids.length, kvF, btsF);
+
+        // INT8 路径 A：整段 prefill（decode 热路径走量化域 pagedAttention）
+        KVCacheManager kv8 = new KVCacheManager(64, cfg.blockSize(), cfg.kvDim(), true);
+        BlockTable[] bts8 = newBlockTables(cfg);
+        ensureCapacity(kv8, bts8, ids.length + 1);
+        float[] prefill8 = model.prefillLogits(ids, kv8, bts8, 0);
+        assertLogitsClose(prefillF, prefill8, "int8 prefill");
+        float[] decode8 = model.decodeLogits(8, ids.length, kv8, bts8);
+        assertLogitsClose(decodeF, decode8, "int8 decode");
+
+        // INT8 路径 B：非块对齐分块 prefill（causalAttentionWithPrefix 的量化域前缀扫描）
+        KVCacheManager kv8c = new KVCacheManager(64, cfg.blockSize(), cfg.kvDim(), true);
+        BlockTable[] bts8c = newBlockTables(cfg);
+        ensureCapacity(kv8c, bts8c, ids.length);
+        model.prefillLogits(Arrays.copyOfRange(ids, 0, 5), kv8c, bts8c, 0);
+        float[] chunked = model.prefillLogits(Arrays.copyOfRange(ids, 5, ids.length), kv8c, bts8c, 5);
+        assertLogitsClose(prefillF, chunked, "int8 分块 prefill");
+    }
+
+    /** logits 容差断言：平均绝对误差 < 1e-2，单点上限放宽到 1e-1（softmax 指数放大尾部） */
+    private static void assertLogitsClose(float[] expected, float[] actual, String label) {
+        assertEquals(expected.length, actual.length, label + " 长度不一致");
+        double sum = 0;
+        float maxDiff = 0f;
+        for (int i = 0; i < expected.length; i++) {
+            float d = Math.abs(expected[i] - actual[i]);
+            sum += d;
+            maxDiff = Math.max(maxDiff, d);
+        }
+        double mean = sum / expected.length;
+        assertTrue(mean < 1e-2, label + " 平均误差超限: " + mean);
+        assertTrue(maxDiff < 1e-1f, label + " 单点误差超限: " + maxDiff);
     }
 
     // ===================== 测试辅助 =====================

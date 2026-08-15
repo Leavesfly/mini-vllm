@@ -1,6 +1,6 @@
 # Weight Loading
 
-本文讲清楚 mini-vllm 如何**零依赖**地把 HuggingFace 的 Qwen3-0.6B 权重加载进内存并组装成可推理的模型：safetensors 二进制解析、BF16→F32 转换、权重命名映射、参数量校验，以及模型自动下载。
+本文讲清楚 mini-vllm 如何**零依赖**地把 HuggingFace 的 Qwen3-0.6B 权重加载进内存并组装成可推理的模型：safetensors 二进制解析、BF16→F32 转换、mmap 按需调页、权重命名映射、参数量校验，以及模型自动下载。
 
 ## 为什么选 safetensors
 
@@ -88,6 +88,67 @@ public static float f16ToFloat(int h) {
     return Float.intBitsToFloat(f32Bits);
 }
 ```
+
+## mmap 按需调页（--precision mmap）
+
+前文的加载路径都把权重**物化进 JVM 堆**（f32/bf16 数组或量化块），堆需求与模型体积成正比。`--precision mmap` 走另一条路：权重留在磁盘，只把文件**映射**进进程地址空间，真正读数据由 OS 按需调页完成——堆里没有任何权重副本，**物理内存小于模型体积也能服务**（实测 `-Xmx512m` 跑 1.5GB 的 Qwen3-0.6B）。
+
+### 映射原理
+
+[MmapWeights.open](../src/main/java/io/leavesfly/minivllm/weights/MmapWeights.java) 对每个 safetensors 分片调用一次 `FileChannel.map(READ_ONLY, 0, size)`：
+
+```java
+MappedByteBuffer mapped = ch.map(FileChannel.MapMode.READ_ONLY, 0, ch.size());
+// 只建页表，不读任何数据 —— Qwen3-0.6B 三个分片 1.5GB 映射耗时 0.0s
+```
+
+之后每次访问映射区触发缺页中断，OS 从磁盘调入 4KB 页进**页缓存**；内存紧张时页缓存自行回收冷页。权重常驻量由 OS 而非 JVM 管理，这正是 llama.cpp / vLLM 加载大模型的方式。
+
+生命周期零成本：`Linear`/`Embedding` 持有的是 `ShortBuffer` 视图，间接强引用 `MappedByteBuffer`，无需 close；unmap 依赖 GC Cleaner，学习项目足够。
+
+### 约束：仅磁盘 BF16
+
+零拷贝的前提是磁盘格式就是算子要的格式。bf16 张量直接 `asShortBuffer()` 得到视图（无拷贝无转换），与堆内 `Linear.ofBf16` 用同一份 `short` 位表示；F32/F16 需要加宽/转换，失去零拷贝意义，直接抛带指引的 IOException。另有两个格式细节：
+
+- safetensors data 区相对文件头按 8 字节对齐（HF 官方 writer 用空格补齐 header），满足 `short` 的 2 字节对齐要求；不对齐的文件会报错提示可能损坏。
+- `MappedByteBuffer` 用 int 寻址，单分片 ≤ 2GB；超大模型按 HF 惯例切分片即可（复用 [SafetensorsLoader](../src/main/java/io/leavesfly/minivllm/weights/SafetensorsLoader.java) 的分片发现逻辑）。
+
+### 行拷贝保 SIMD：核心取舍
+
+堆内路径的 SIMD 内核（`DotKernel` 基于 Vector API）作用在 `short[]`/`float[]` 数组上，无法直接吃 `ShortBuffer`。两条路：
+
+1. **逐元素读**：`ShortBuffer.get(i)` 每元素一次边界检查 + 方法调用，丢掉 SIMD，慢数倍；
+2. **行拷贝**（本项目采用）：每行权重 bulk 读进线程私有行缓冲，再走**原封不动**的 `KERNEL.dotBf16`：
+
+```java
+// Matmul：ThreadLocal 行缓冲只增不缩，并发线程各自持有
+public static float dotBf16Mapped(ShortBuffer w, int wOff, float[] x, int xOff, int len) {
+    short[] row = mmapRowBuffer(len);
+    w.get(wOff, row, 0, len);          // 绝对位置 bulk 读，不移动 position，线程安全
+    return KERNEL.dotBf16(row, 0, x, xOff, len);  // SIMD 内核与堆内路径逐位同一份
+}
+```
+
+行拷贝的代价是每行权重多一次内存复制（decode 每步全量权重过一遍），换来的是与堆内 bf16 **bitwise 一致**的输出和完整的 Vector API 加速——同一行数据、同一个点积内核，数值不可能分叉。
+
+与 llama.cpp 对照：llama.cpp 用 C++ 直接在 mmap 内存上做 SIMD（无对齐/数组限制，无行拷贝），mini-vllm 受限于 Vector API 只接受 Java 数组才引入行缓冲。两者共同的本质是**页缓存承载权重、堆/进程内存只放激活与 KV**。
+
+### 算子与装配
+
+- [Linear](../src/main/java/io/leavesfly/minivllm/model/Linear.java) / [Embedding](../src/main/java/io/leavesfly/minivllm/model/Embedding.java) 新增 mmap 模式（`ofMmapBf16` 工厂 + `isMmapBf16()` 判定），forward/forwardBatch/lookup/projectToVocab 全路径覆盖——lm_head 是全模型最大投影，必须走 mapped 内核；
+- [Qwen3Attention](../src/main/java/io/leavesfly/minivllm/model/Qwen3Attention.java) 的 fusedQKV 融合需要拼接三份权重（会物化回堆），mmap 模式跳过融合、decode 回退三路独立投影，数值逐行等价；
+- [Qwen3Loader.loadMmap](../src/main/java/io/leavesfly/minivllm/weights/Qwen3Loader.java) 经 `MmapWeightSource` 装配，复用与堆内路径相同的 `buildModel` + 三重校验；RMSNorm gamma 是小数组，一次性 bulk 读入转 f32 常驻堆；
+- [ModelFamily](../src/main/java/io/leavesfly/minivllm/family/ModelFamily.java) 对 MMAP 跳过 `ensureHeapFor` 堆预检（权重不占堆，预检无意义）。
+
+### 实测（Qwen3-0.6B，Apple Silicon）
+
+| 指标 | bf16 堆内 | mmap |
+|---|---|---|
+| 堆需求 | ~3GB | 数百 MB（行缓冲 + KV cache） |
+| 加载耗时 | 秒级（读盘 + 转换） | 0.0s（仅映射） |
+| 生成速度（页缓存热后） | ~35 tok/s | ~23 tok/s |
+
+冷页首次访问要承担缺页读盘，顺序扫描一遍权重后趋于稳定。
 
 ## 权重命名映射：从 HF 张量到 Qwen3Model
 
@@ -231,3 +292,4 @@ Qwen3 模式下，[BpeTokenizer.fromModelDir](../src/main/java/io/leavesfly/mini
 - 加载后的权重如何参与计算：[Transformer](Transformer.md)
 - 分词器与 ChatML：[OpenAI-API](OpenAI-API.md)
 - 首次启动的下载流程：[Getting-Started](Getting-Started.md)
+- mmap 的数值一致性测试：[MmapWeightsTest](../src/test/java/io/leavesfly/minivllm/weights/MmapWeightsTest.java)（mmap vs 堆内 bf16 逐位对齐）
