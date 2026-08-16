@@ -1,0 +1,1143 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>mini-vllm 全景解读 — 用纯 Java 实现的 vLLM 核心机制</title>
+<style>
+  :root {
+    --bg: #0b0f17;
+    --panel: #111826;
+    --panel-2: #16202f;
+    --border: #223047;
+    --text: #e6edf3;
+    --muted: #9aa7b8;
+    --accent: #4f8cff;
+    --accent-2: #8b5cf6;
+    --teal: #2dd4bf;
+    --amber: #f59e0b;
+    --rose: #fb7185;
+    --green: #34d399;
+    --code-bg: #0d1420;
+    --radius: 14px;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    line-height: 1.75;
+    font-size: 15.5px;
+  }
+  .container { max-width: 1080px; margin: 0 auto; padding: 0 24px; }
+
+  /* ── Hero ─────────────────────────────── */
+  .hero {
+    position: relative;
+    padding: 90px 0 70px;
+    background:
+      radial-gradient(ellipse 60% 50% at 20% 0%, rgba(79,140,255,.18), transparent),
+      radial-gradient(ellipse 50% 40% at 85% 10%, rgba(139,92,246,.15), transparent);
+    border-bottom: 1px solid var(--border);
+    overflow: hidden;
+  }
+  .hero .badges { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 22px; }
+  .badge {
+    font-size: 12.5px; padding: 4px 12px; border-radius: 999px;
+    border: 1px solid var(--border); background: rgba(255,255,255,.03); color: var(--muted);
+  }
+  .badge.hot { border-color: rgba(79,140,255,.5); color: #9cc2ff; background: rgba(79,140,255,.1); }
+  .hero h1 {
+    font-size: 46px; font-weight: 800; letter-spacing: -1px; line-height: 1.2;
+    background: linear-gradient(100deg, #fff 30%, #9cc2ff 70%, #c4b5fd);
+    -webkit-background-clip: text; background-clip: text; color: transparent;
+  }
+  .hero .subtitle { margin-top: 18px; font-size: 17.5px; color: var(--muted); max-width: 760px; }
+  .hero .subtitle b { color: var(--text); font-weight: 600; }
+  .hero-stats { display: flex; gap: 14px; flex-wrap: wrap; margin-top: 34px; }
+  .stat {
+    background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius);
+    padding: 14px 22px; min-width: 150px;
+  }
+  .stat .num { font-size: 26px; font-weight: 700; color: var(--accent); }
+  .stat .lbl { font-size: 12.5px; color: var(--muted); margin-top: 2px; }
+
+  /* ── 目录 ─────────────────────────────── */
+  .toc {
+    position: sticky; top: 0; z-index: 50;
+    background: rgba(11,15,23,.86); backdrop-filter: blur(10px);
+    border-bottom: 1px solid var(--border);
+  }
+  .toc-inner { display: flex; gap: 4px; overflow-x: auto; padding: 10px 24px; max-width: 1080px; margin: 0 auto; }
+  .toc a {
+    color: var(--muted); text-decoration: none; font-size: 13.5px; white-space: nowrap;
+    padding: 6px 13px; border-radius: 8px; transition: all .15s;
+  }
+  .toc a:hover { color: var(--text); background: rgba(255,255,255,.06); }
+
+  /* ── 章节通用 ──────────────────────────── */
+  section { padding: 64px 0 12px; }
+  .sec-tag {
+    display: inline-block; font-size: 12.5px; font-weight: 700; letter-spacing: 2px;
+    color: var(--accent); text-transform: uppercase; margin-bottom: 10px;
+  }
+  h2 { font-size: 30px; font-weight: 800; letter-spacing: -.5px; margin-bottom: 8px; }
+  .sec-desc { color: var(--muted); margin-bottom: 28px; max-width: 820px; }
+  h3 { font-size: 19px; font-weight: 700; margin: 34px 0 12px; }
+  h3::before { content: "▎"; color: var(--accent); margin-right: 4px; }
+  p { margin: 10px 0; }
+  p b, li b { color: #cfe0ff; }
+  ul, ol { padding-left: 24px; margin: 10px 0; }
+  li { margin: 5px 0; }
+
+  /* ── 卡片 / 表格 / 代码 ─────────────────── */
+  .card {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 22px 26px; margin: 18px 0;
+  }
+  .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  .grid-3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
+  @media (max-width: 800px) { .grid-2, .grid-3 { grid-template-columns: 1fr; } }
+  .feature { background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); padding: 18px 20px; }
+  .feature .icon { font-size: 22px; margin-bottom: 8px; }
+  .feature h4 { font-size: 15.5px; margin-bottom: 6px; }
+  .feature p { font-size: 13.5px; color: var(--muted); margin: 0; }
+  table { width: 100%; border-collapse: collapse; margin: 16px 0; font-size: 14px; }
+  th, td { text-align: left; padding: 10px 14px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  th { color: var(--muted); font-weight: 600; font-size: 13px; background: rgba(255,255,255,.02); }
+  tr:hover td { background: rgba(255,255,255,.015); }
+  code {
+    font-family: "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+    font-size: 13px; background: rgba(79,140,255,.12); color: #9cc2ff;
+    padding: 1.5px 6px; border-radius: 5px;
+  }
+  pre {
+    background: var(--code-bg); border: 1px solid var(--border); border-radius: 10px;
+    padding: 16px 20px; overflow-x: auto; margin: 14px 0; line-height: 1.65;
+  }
+  pre code { background: none; padding: 0; color: #c8d6ea; }
+  .note {
+    border-left: 3px solid var(--amber); background: rgba(245,158,11,.07);
+    padding: 12px 18px; border-radius: 0 10px 10px 0; margin: 16px 0; font-size: 14px; color: #d9c9a3;
+  }
+  .note b { color: var(--amber); }
+  .tip {
+    border-left: 3px solid var(--teal); background: rgba(45,212,191,.07);
+    padding: 12px 18px; border-radius: 0 10px 10px 0; margin: 16px 0; font-size: 14px; color: #a7ded4;
+  }
+  .tip b { color: var(--teal); }
+
+  /* ── 图 ──────────────────────────────── */
+  .figure {
+    background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius);
+    padding: 22px; margin: 22px 0; overflow-x: auto;
+  }
+  .figure svg { display: block; margin: 0 auto; max-width: 100%; height: auto; }
+  .fig-caption { text-align: center; color: var(--muted); font-size: 13px; margin-top: 14px; }
+
+  /* SVG 通用文字 */
+  svg text { font-family: -apple-system, "PingFang SC", sans-serif; }
+  .svg-label { fill: #e6edf3; font-size: 13px; }
+  .svg-sub { fill: #9aa7b8; font-size: 11.5px; }
+  .svg-title { fill: #e6edf3; font-size: 14.5px; font-weight: 700; }
+
+  footer { margin-top: 70px; padding: 36px 0 50px; border-top: 1px solid var(--border); color: var(--muted); font-size: 13.5px; }
+  footer a { color: var(--accent); text-decoration: none; }
+  a.src { color: var(--accent); text-decoration: none; }
+  a.src:hover { text-decoration: underline; }
+</style>
+</head>
+<body>
+
+<!-- ═══════════════════ HERO ═══════════════════ -->
+<header class="hero">
+  <div class="container">
+    <div class="badges">
+      <span class="badge hot">学习型项目</span>
+      <span class="badge">Java 17 · 零外部依赖</span>
+      <span class="badge">PagedAttention</span>
+      <span class="badge">Continuous Batching</span>
+      <span class="badge">Qwen3 / Llama / MiniMind3</span>
+      <span class="badge">OpenAI 兼容 API</span>
+    </div>
+    <h1>mini-vllm 全景解读</h1>
+    <p class="subtitle">
+      用<b>纯 Java（零外部依赖）</b>从零实现的学习型 vLLM 引擎。它用 Java 堆数组模拟 GPU 显存、
+      用逐 block 循环模拟 PagedAttention CUDA kernel、用单线程 step 循环模拟 vLLM 的 scheduler+worker，
+      让你<b>通过代码而非论文</b>真正理解 vLLM 为什么快、为什么省显存。
+    </p>
+    <div class="hero-stats">
+      <div class="stat"><div class="num">0</div><div class="lbl">运行期第三方依赖</div></div>
+      <div class="stat"><div class="num">596M</div><div class="lbl">默认模型 Qwen3-0.6B 参数</div></div>
+      <div class="stat"><div class="num">6 层</div><div class="lbl">API → Core → Model → Memory → Math → 辅助</div></div>
+      <div class="stat"><div class="num">逐 token</div><div class="lbl">与 HuggingFace 参考实现对齐</div></div>
+    </div>
+  </div>
+</header>
+
+<!-- ═══════════════════ 目录 ═══════════════════ -->
+<nav class="toc">
+  <div class="toc-inner">
+    <a href="#overview">① 项目定位</a>
+    <a href="#architecture">② 分层架构</a>
+    <a href="#journey">③ 请求之旅</a>
+    <a href="#paged">④ PagedAttention</a>
+    <a href="#batching">⑤ Continuous Batching</a>
+    <a href="#transformer">⑥ Transformer</a>
+    <a href="#kvcache">⑦ KV Cache 内存</a>
+    <a href="#weights">⑧ 权重加载</a>
+    <a href="#api">⑨ OpenAI API</a>
+    <a href="#vllm">⑩ 对照真实 vLLM</a>
+    <a href="#testing">⑪ 测试对齐</a>
+    <a href="#learning">⑫ 学习路径</a>
+  </div>
+</nav>
+
+<main class="container">
+
+<!-- ═══════════════════ §1 项目定位 ═══════════════════ -->
+<section id="overview">
+  <span class="sec-tag">Overview</span>
+  <h2>① 项目定位：一座可运行的教学实验室</h2>
+  <p class="sec-desc">
+    mini-vllm 不是生产级推理引擎，而是一座「<b>可运行、可阅读、可改造</b>」的教学实验室。
+    它复刻了 vLLM 的三大核心支柱：<b>PagedAttention 内存管理</b>（省显存）、
+    <b>Continuous Batching 动态调度</b>（提吞吐）、<b>完整 CPU Transformer 前向</b>（真实可对话），
+    并且加载真实模型权重，与 HuggingFace 参考输出数值对齐。
+  </p>
+
+  <div class="grid-3">
+    <div class="feature"><div class="icon">📄</div><h4>PagedAttention</h4>
+      <p><code>BlockPool</code> + <code>BlockTable</code> 按需分页管理 KV cache，引用计数支持前缀共享，几乎消除内存碎片。</p></div>
+    <div class="feature"><div class="icon">🔄</div><h4>Continuous Batching</h4>
+      <p><code>LLMEngine</code> 的 admit → decode → sweep 三段循环，请求随时进出，KV 块即释即用。</p></div>
+    <div class="feature"><div class="icon">🧠</div><h4>真实模型前向</h4>
+      <p>Qwen3 架构全实现：RMSNorm / RoPE / GQA / SwiGLU / QK-Norm，与 HF 逐 token 对齐。</p></div>
+    <div class="feature"><div class="icon">🔤</div><h4>byte-level BPE</h4>
+      <p>纯 Java 分词器 + ChatML/Jinja 对话模板 + 增量 UTF-8 解码，流式输出不乱码。</p></div>
+    <div class="feature"><div class="icon">⚡</div><h4>SIMD 加速</h4>
+      <p><code>DotKernel</code> 基于 JDK Vector API 的向量化点积，缺失时自动回退标量实现。</p></div>
+    <div class="feature"><div class="icon">🌐</div><h4>OpenAI 兼容服务</h4>
+      <p>JDK HttpServer 提供 <code>/v1/chat/completions</code>（SSE 流式）+ 内置 Web 对话页 + 多模型路由。</p></div>
+  </div>
+
+  <h3>关键事实速查</h3>
+  <table>
+    <tr><th>维度</th><th>值</th></tr>
+    <tr><td>语言 / 构建</td><td>Java 17 / Maven（零业务依赖，仅 JUnit 5 用于测试）</td></tr>
+    <tr><td>入口类</td><td><code>io.leavesfly.minivllm.MiniVllmServer</code></td></tr>
+    <tr><td>默认模型</td><td>扫描 <code>models/</code> 全部模型；<code>minimind-3-agent-512</code> 为默认并预热，其余懒加载</td></tr>
+    <tr><td>可选模型</td><td>Qwen3-0.6B（28 层 / hidden 1024 / 16 Q 头 + 8 KV 头 / vocab 151936）、Llama-3.2-1B-Instruct</td></tr>
+    <tr><td>兼容接口</td><td><code>/v1/chat/completions</code>、<code>/v1/completions</code>、<code>/v1/models</code>、Web 对话页 <code>/</code></td></tr>
+    <tr><td>权重精度</td><td>f32 / bf16 / int8 / int4（量化）/ mmap（内存映射不落堆）</td></tr>
+    <tr><td>默认端口</td><td>8080</td></tr>
+  </table>
+</section>
+
+<!-- ═══════════════════ §2 分层架构 ═══════════════════ -->
+<section id="architecture">
+  <span class="sec-tag">Architecture</span>
+  <h2>② 分层架构：六层自上而下的清晰依赖</h2>
+  <p class="sec-desc">
+    依赖方向严格自上而下：上层依赖下层，下层不反向依赖，这让每一层都能独立测试。
+    引擎与具体模型通过 <code>LlmModel</code> 接口解耦——引擎只关心
+    <code>prefillLogits</code> / <code>decodeLogits</code> 两个方法，对 Qwen3 还是 GPT 微模型完全无感。
+  </p>
+
+  <div class="figure">
+    <svg viewBox="0 0 920 560" width="920" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="分层架构图">
+      <defs>
+        <linearGradient id="lg1" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#4f8cff"/><stop offset="1" stop-color="#6aa5ff"/></linearGradient>
+        <linearGradient id="lg2" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#8b5cf6"/><stop offset="1" stop-color="#a78bfa"/></linearGradient>
+        <linearGradient id="lg3" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#2dd4bf"/><stop offset="1" stop-color="#5eead4"/></linearGradient>
+        <linearGradient id="lg4" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#f59e0b"/><stop offset="1" stop-color="#fbbf24"/></linearGradient>
+        <linearGradient id="lg5" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#fb7185"/><stop offset="1" stop-color="#fda4af"/></linearGradient>
+        <linearGradient id="lg6" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#64748b"/><stop offset="1" stop-color="#94a3b8"/></linearGradient>
+      </defs>
+      <!-- 六层 -->
+      <g>
+        <rect x="40" y="20"  width="560" height="72" rx="12" fill="url(#lg1)" opacity=".92"/>
+        <text x="64" y="50" class="svg-title" fill="#fff">API 层 · api</text>
+        <text x="64" y="72" class="svg-sub" fill="#dbeafe">OpenAiHandler · SseWriter · WebUiHandler</text>
+        <text x="620" y="52" class="svg-sub">OpenAI 兼容 HTTP</text>
+        <text x="620" y="72" class="svg-sub">SSE 流式 + Web 对话页</text>
+
+        <rect x="40" y="108" width="560" height="72" rx="12" fill="url(#lg2)" opacity=".92"/>
+        <text x="64" y="138" class="svg-title" fill="#fff">Core 层 · core</text>
+        <text x="64" y="160" class="svg-sub" fill="#ede9fe">LLMEngine · Scheduler · Sequence · ModelHub · ModelRuntime</text>
+        <text x="620" y="140" class="svg-sub">Continuous Batching 调度</text>
+        <text x="620" y="160" class="svg-sub">多模型注册与路由</text>
+
+        <rect x="40" y="196" width="560" height="72" rx="12" fill="url(#lg3)" opacity=".92"/>
+        <text x="64" y="226" class="svg-title" fill="#04211c">Model 层 · model / family</text>
+        <text x="64" y="248" class="svg-sub" fill="#0f3d36">Qwen3Model/Block/Attention · TransformerModel · RoPE · ModelFamily SPI</text>
+        <text x="620" y="228" class="svg-sub">Qwen3 / Llama / GPT 前向</text>
+        <text x="620" y="248" class="svg-sub">prefill + decode 双路径</text>
+
+        <rect x="40" y="284" width="560" height="72" rx="12" fill="url(#lg4)" opacity=".92"/>
+        <text x="64" y="314" class="svg-title" fill="#3b2503">Memory 层 · memory</text>
+        <text x="64" y="336" class="svg-sub" fill="#4a3306">KVCacheManager · BlockPool · BlockTable</text>
+        <text x="620" y="316" class="svg-sub">PagedAttention</text>
+        <text x="620" y="336" class="svg-sub">KV cache 内存管理</text>
+
+        <rect x="40" y="372" width="560" height="72" rx="12" fill="url(#lg5)" opacity=".92"/>
+        <text x="64" y="402" class="svg-title" fill="#3f0710">Math 层 · math</text>
+        <text x="64" y="424" class="svg-sub" fill="#4c0a15">Tensor · Matmul · DotKernel(SIMD) · RmsNorm · Softmax · Sampler</text>
+        <text x="620" y="404" class="svg-sub">纯 Java 张量算子</text>
+        <text x="620" y="424" class="svg-sub">Vector API 加速</text>
+
+        <rect x="40" y="460" width="560" height="72" rx="12" fill="url(#lg6)" opacity=".92"/>
+        <text x="64" y="490" class="svg-title" fill="#fff">辅助层 · weights / tokenizer / json</text>
+        <text x="64" y="512" class="svg-sub" fill="#e2e8f0">SafetensorsLoader · MmapWeights · BpeTokenizer · JinjaChatTemplate · SimpleJson</text>
+        <text x="620" y="492" class="svg-sub">权重解析/下载</text>
+        <text x="620" y="512" class="svg-sub">BPE/对话模板 · JSON</text>
+      </g>
+      <!-- 依赖箭头 -->
+      <g stroke="#3a4a63" stroke-width="1.6" marker-end="url(#arrow)">
+        <defs><marker id="arrow" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 z" fill="#3a4a63"/></marker></defs>
+        <line x1="320" y1="92"  x2="320" y2="104"/>
+        <line x1="320" y1="180" x2="320" y2="192"/>
+        <line x1="320" y1="268" x2="320" y2="280"/>
+        <line x1="320" y1="356" x2="320" y2="368"/>
+        <line x1="320" y1="444" x2="320" y2="456"/>
+      </g>
+    </svg>
+    <div class="fig-caption">图 2-1　六层架构与依赖方向（严格自上而下，每层可独立测试）</div>
+  </div>
+
+  <h3>包结构与职责</h3>
+  <table>
+    <tr><th>包</th><th>关键类</th><th>职责</th></tr>
+    <tr><td>（根）</td><td><code>MiniVllmServer</code></td><td>入口：解析参数、扫描 models/、装配模型、启动引擎与 HTTP</td></tr>
+    <tr><td><code>api</code></td><td><code>OpenAiHandler</code>、<code>SseWriter</code>、<code>WebUiHandler</code></td><td>OpenAI 兼容端点、SSE 流式、内置 Web 对话页</td></tr>
+    <tr><td><code>core</code></td><td><code>LLMEngine</code>、<code>Scheduler</code>、<code>Sequence</code>、<code>ModelHub</code></td><td>Continuous Batching 调度与请求状态机；多模型懒加载与路由</td></tr>
+    <tr><td><code>model</code> / <code>family</code></td><td><code>Qwen3Model</code>、<code>Qwen3Attention</code>、<code>ModelFamily</code>、<code>Qwen3Family</code>、<code>LlamaFamily</code></td><td>模型前向；家族差异收敛在 ModelFamily SPI（META-INF/services 注册）</td></tr>
+    <tr><td><code>memory</code></td><td><code>KVCacheManager</code>、<code>BlockPool</code>、<code>BlockTable</code></td><td>PagedAttention KV cache 内存管理</td></tr>
+    <tr><td><code>math</code></td><td><code>Matmul</code>、<code>DotKernel</code>、<code>RmsNorm</code>、<code>Sampler</code></td><td>纯 Java 数值算子（含 SIMD 点积与行并行）</td></tr>
+    <tr><td><code>weights</code></td><td><code>SafetensorsLoader</code>、<code>MmapWeights</code>、<code>Qwen3Loader</code>、<code>ModelDownloader</code></td><td>权重解析（BF16/F16）、mmap 映射、组装校验、断点续传下载</td></tr>
+    <tr><td><code>tokenizer</code></td><td><code>BpeTokenizer</code>、<code>JinjaChatTemplate</code>、<code>IncrementalDecoder</code></td><td>byte-level BPE、Jinja 子集模板渲染、增量 UTF-8 解码</td></tr>
+    <tr><td><code>json</code></td><td><code>SimpleJson</code></td><td>零依赖手写 JSON 编解码</td></tr>
+  </table>
+
+  <div class="tip"><b>核心抽象</b>：引擎通过 <code>LlmModel</code> 接口与模型解耦，只调用
+    <code>prefillLogits(tokenIds, kvMgr, bts, startIdx)</code>（整段 prompt 前向）与
+    <code>decodeLogits(tokenId, curIdx, kvMgr, bts)</code>（单 token 前向）。
+    两套实现（Qwen3 / GPT 微模型）都同时提供「引擎路径」与「PyTorch 风格 forward 路径」（后者用于与 HF 对拍）。</div>
+</section>
+
+<!-- ═══════════════════ §3 请求之旅 ═══════════════════ -->
+<section id="journey">
+  <span class="sec-tag">Request Journey</span>
+  <h2>③ 一条请求的完整旅程</h2>
+  <p class="sec-desc">
+    以 <code>POST /v1/chat/completions</code>（stream=true）为例：文本从 HTTP 进来，经分词、调度、
+    prefill、逐 token decode、采样、增量解码，最后以 SSE chunk 流式返回。
+  </p>
+
+  <div class="figure">
+    <svg viewBox="0 0 940 640" width="940" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="请求数据流图">
+      <defs>
+        <marker id="ar2" markerWidth="9" markerHeight="9" refX="7" refY="3.5" orient="auto"><path d="M0,0 L7,3.5 L0,7 z" fill="#4f8cff"/></marker>
+        <marker id="ar3" markerWidth="9" markerHeight="9" refX="7" refY="3.5" orient="auto"><path d="M0,0 L7,3.5 L0,7 z" fill="#2dd4bf"/></marker>
+      </defs>
+      <!-- 步骤节点 -->
+      <g>
+        <rect x="60" y="20" width="380" height="66" rx="10" fill="#16233a" stroke="#4f8cff" stroke-width="1.4"/>
+        <text x="80" y="46" class="svg-title">① HTTP 请求到达（api 层）</text>
+        <text x="80" y="68" class="svg-sub">OpenAiHandler：SimpleJson 解析 body，按 model 字段路由到 ModelRuntime</text>
+
+        <rect x="60" y="112" width="380" height="66" rx="10" fill="#16233a" stroke="#4f8cff" stroke-width="1.4"/>
+        <text x="80" y="138" class="svg-title">② 提示词渲染 + 分词</text>
+        <text x="80" y="160" class="svg-sub">messages → JinjaChatTemplate 渲染 ChatML → BpeTokenizer.encode → int[]</text>
+
+        <rect x="60" y="204" width="380" height="66" rx="10" fill="#241a35" stroke="#8b5cf6" stroke-width="1.4"/>
+        <text x="80" y="230" class="svg-title">③ addRequest：构造 Sequence 入队</text>
+        <text x="80" y="252" class="svg-sub">每层一张 BlockTable + 注入增量解码器 onToken 回调 → Scheduler.waiting</text>
+
+        <rect x="60" y="296" width="380" height="66" rx="10" fill="#241a35" stroke="#8b5cf6" stroke-width="1.4"/>
+        <text x="80" y="322" class="svg-title">④ admit：prefill 整段 prompt</text>
+        <text x="80" y="344" class="svg-sub">ensureCapacity 分配 KV block → prefillLogits → 采样首 token → running</text>
+
+        <rect x="60" y="388" width="380" height="66" rx="10" fill="#241a35" stroke="#8b5cf6" stroke-width="1.4"/>
+        <text x="80" y="414" class="svg-title">⑤ decode：逐 token 循环</text>
+        <text x="80" y="436" class="svg-sub">decodeLogits（PagedAttention 复用历史 KV）→ 采样 → emitToken 回调</text>
+
+        <rect x="60" y="480" width="380" height="66" rx="10" fill="#123029" stroke="#2dd4bf" stroke-width="1.4"/>
+        <text x="80" y="506" class="svg-title">⑥ sweep：完成与释放</text>
+        <text x="80" y="528" class="svg-sub">命中 EOS / max_tokens → 冲刷增量解码器 → free 全部 KV block</text>
+
+        <rect x="60" y="572" width="380" height="56" rx="10" fill="#123029" stroke="#2dd4bf" stroke-width="1.4"/>
+        <text x="80" y="598" class="svg-title">⑦ SSE 流式响应</text>
+        <text x="80" y="618" class="svg-sub">onToken → SseWriter.write：data: {...} → data: [DONE]</text>
+      </g>
+      <!-- 主箭头 -->
+      <g stroke="#4f8cff" stroke-width="1.8" fill="none" marker-end="url(#ar2)">
+        <line x1="250" y1="86"  x2="250" y2="108"/>
+        <line x1="250" y1="178" x2="250" y2="200"/>
+      </g>
+      <g stroke="#8b5cf6" stroke-width="1.8" fill="none" marker-end="url(#ar2)">
+        <line x1="250" y1="270" x2="250" y2="292"/>
+        <line x1="250" y1="362" x2="250" y2="384"/>
+      </g>
+      <g stroke="#2dd4bf" stroke-width="1.8" fill="none" marker-end="url(#ar3)">
+        <line x1="250" y1="454" x2="250" y2="476"/>
+        <line x1="250" y1="546" x2="250" y2="568"/>
+      </g>
+      <!-- decode 自循环 -->
+      <path d="M 440 421 C 500 421, 500 380, 445 390" stroke="#8b5cf6" stroke-width="1.6" fill="none" marker-end="url(#ar2)" stroke-dasharray="5 4"/>
+      <text x="505" y="404" class="svg-sub" fill="#a78bfa">每步一个 token</text>
+
+      <!-- 右侧：线程说明 -->
+      <g>
+        <rect x="560" y="20" width="340" height="250" rx="12" fill="#101827" stroke="#223047"/>
+        <text x="582" y="50" class="svg-title">线程模型：单引擎 + 多 HTTP</text>
+        <rect x="582" y="66" width="296" height="40" rx="8" fill="#1a2740"/>
+        <text x="596" y="91" class="svg-label">mini-vllm-engine（守护线程）</text>
+        <text x="582" y="124" class="svg-sub">持续 step()：admit→decode→sweep，独占推进全部请求</text>
+        <rect x="582" y="138" width="296" height="40" rx="8" fill="#1c3a34"/>
+        <text x="596" y="163" class="svg-label">HTTP 线程池 max(16, maxSeqs×4)</text>
+        <text x="582" y="196" class="svg-sub">解析请求、入队、阻塞轮询 seq.isFinished()、写 SSE</text>
+        <rect x="582" y="210" width="296" height="40" rx="8" fill="#33240f"/>
+        <text x="596" y="235" class="svg-label">Matmul 线程池（按 CPU 核数）</text>
+        <text x="582" y="262" class="svg-sub">矩阵乘按输出行分块并行，加速单请求前向</text>
+
+        <rect x="560" y="296" width="340" height="204" rx="12" fill="#101827" stroke="#223047"/>
+        <text x="582" y="326" class="svg-title">跨线程数据交接点</text>
+        <text x="582" y="354" class="svg-sub">• waiting 队列：ConcurrentLinkedDeque（HTTP 写 / 引擎读）</text>
+        <text x="582" y="380" class="svg-sub">• Sequence.stage：volatile（引擎写 / HTTP 读判完成）</text>
+        <text x="582" y="406" class="svg-sub">• SseWriter.write：synchronized（引擎线程触发回调）</text>
+        <text x="582" y="438" class="svg-sub">请求与引擎解耦：handler 只负责入队 + 等待 + 写流，</text>
+        <text x="582" y="458" class="svg-sub">实际推进由后台引擎线程完成。</text>
+      </g>
+    </svg>
+    <div class="fig-caption">图 3-1　一条流式请求从 HTTP 到 SSE 的完整旅程（左）与线程模型（右）</div>
+  </div>
+</section>
+
+<!-- ═══════════════════ §4 PagedAttention ═══════════════════ -->
+<section id="paged">
+  <span class="sec-tag">Core Mechanism Ⅰ</span>
+  <h2>④ PagedAttention：像操作系统分页一样管理 KV cache</h2>
+  <p class="sec-desc">
+    vLLM 的核心创新，也是本项目最值得吃透的机制。自回归生成要缓存每个 token 的 K/V 向量；
+    传统做法按 <code>max_seq_len</code> 为每个请求预留整段连续显存，带来严重的内部碎片与外部碎片，
+    显存利用率常常只有 20~40%。PagedAttention 的解法是：<b>把 KV cache 切成等大的物理块（block），
+    逻辑连续的序列可以物理散落，靠页表（BlockTable）串起来</b>——正是操作系统虚拟内存的思想。
+  </p>
+
+  <div class="figure">
+    <svg viewBox="0 0 940 300" width="940" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="连续预留与分页对比">
+      <!-- 左：传统连续预留 -->
+      <text x="30" y="34" class="svg-title">传统做法：按 max_seq_len 连续预留</text>
+      <g>
+        <rect x="30" y="50" width="380" height="34" rx="4" fill="#1c2940" stroke="#33465f"/>
+        <rect x="30" y="50" width="120" height="34" fill="#4f8cff" opacity=".85"/>
+        <rect x="150" y="50" width="260" height="34" fill="#3b1f2b" stroke="#fb7185" stroke-dasharray="4 3"/>
+        <text x="38" y="72" class="svg-sub" fill="#fff">实际使用的 KV</text>
+        <text x="200" y="72" class="svg-sub" fill="#fb7185">内部碎片：预留但永远用不到</text>
+
+        <rect x="30" y="96" width="380" height="34" rx="4" fill="#1c2940" stroke="#33465f"/>
+        <rect x="30" y="96" width="290" height="34" fill="#4f8cff" opacity=".85"/>
+        <rect x="320" y="96" width="90" height="34" fill="#3b1f2b" stroke="#fb7185" stroke-dasharray="4 3"/>
+
+        <rect x="30" y="142" width="380" height="34" rx="4" fill="#1c2940" stroke="#33465f"/>
+        <rect x="30" y="142" width="70" height="34" fill="#4f8cff" opacity=".85"/>
+        <rect x="100" y="142" width="310" height="34" fill="#3b1f2b" stroke="#fb7185" stroke-dasharray="4 3"/>
+      </g>
+      <text x="30" y="206" class="svg-sub">✗ 请求短 → 预留尾部全浪费（内部碎片）</text>
+      <text x="30" y="228" class="svg-sub">✗ 请求结束 → 留下大小不一的空洞（外部碎片）</text>
+      <text x="30" y="250" class="svg-sub">✗ 显存利用率仅 20~40%，并发被严重限制</text>
+
+      <!-- 右：分页 -->
+      <text x="500" y="34" class="svg-title">PagedAttention：等大 block + 页表映射</text>
+      <g>
+        <rect x="500" y="50" width="380" height="34" rx="4" fill="#123029" stroke="#2dd4bf"/>
+        <text x="512" y="72" class="svg-sub" fill="#a7ded4">请求 A：block 3 → block 1 → block 7（只用到最后一个块的一小部分）</text>
+        <rect x="500" y="96" width="380" height="34" rx="4" fill="#241a35" stroke="#8b5cf6"/>
+        <text x="512" y="118" class="svg-sub" fill="#c4b5fd">请求 B：block 5 → block 2（随时按需再分配新块）</text>
+        <rect x="500" y="142" width="380" height="34" rx="4" fill="#1c2940" stroke="#33465f"/>
+        <text x="512" y="164" class="svg-sub">空闲块：0、4、6、8…（任意块可用，不要求连续）</text>
+      </g>
+      <text x="500" y="206" class="svg-sub" fill="#34d399">✓ 内部碎片极小：最多浪费最后一个 block 的尾部</text>
+      <text x="500" y="228" class="svg-sub" fill="#34d399">✓ 无外部碎片：block 等大，任意空闲块可分配</text>
+      <text x="500" y="250" class="svg-sub" fill="#34d399">✓ 天然支持共享：引用计数让多请求指向同一 block（前缀共享）</text>
+    </svg>
+    <div class="fig-caption">图 4-1　连续预留（左）与分页管理（右）的碎片对比 —— vLLM 显存利用率远高于传统实现的根本原因</div>
+  </div>
+
+  <h3>操作系统概念对照</h3>
+  <table>
+    <tr><th>操作系统</th><th>PagedAttention</th><th>mini-vllm 类</th></tr>
+    <tr><td>物理页框</td><td>物理 KV block</td><td><a class="src" href="../src/main/java/io/leavesfly/minivllm/memory/BlockPool.java"><code>BlockPool.KVBlock</code></a></td></tr>
+    <tr><td>页表</td><td>per-seq block table</td><td><a class="src" href="../src/main/java/io/leavesfly/minivllm/memory/BlockTable.java"><code>BlockTable</code></a>（每请求每层一张）</td></tr>
+    <tr><td>虚拟页号→物理页框号</td><td>逻辑 token → 物理 block</td><td><code>tokenIdx / blockSize → blockTable.blockIdAt(...)</code></td></tr>
+    <tr><td>页框分配器</td><td>block 分配器</td><td><code>BlockPool.allocate / release</code>（空闲 id 队列 + 引用计数）</td></tr>
+  </table>
+
+  <div class="figure">
+    <svg viewBox="0 0 940 330" width="940" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="逻辑到物理映射示意">
+      <defs><marker id="ar4" markerWidth="9" markerHeight="9" refX="7" refY="3.5" orient="auto"><path d="M0,0 L7,3.5 L0,7 z" fill="#f59e0b"/></marker></defs>
+      <!-- 逻辑序列 -->
+      <text x="30" y="34" class="svg-title">逻辑 KV 序列（blockSize = 4）</text>
+      <g>
+        <g font-size="11.5">
+          <rect x="30"  y="50" width="36" height="36" rx="4" fill="#4f8cff" opacity=".85"/><text x="42" y="73" fill="#fff" text-anchor="middle">t0</text>
+          <rect x="68"  y="50" width="36" height="36" rx="4" fill="#4f8cff" opacity=".85"/><text x="80" y="73" fill="#fff" text-anchor="middle">t1</text>
+          <rect x="106" y="50" width="36" height="36" rx="4" fill="#4f8cff" opacity=".85"/><text x="118" y="73" fill="#fff" text-anchor="middle">t2</text>
+          <rect x="144" y="50" width="36" height="36" rx="4" fill="#4f8cff" opacity=".85"/><text x="156" y="73" fill="#fff" text-anchor="middle">t3</text>
+          <rect x="192" y="50" width="36" height="36" rx="4" fill="#8b5cf6" opacity=".85"/><text x="204" y="73" fill="#fff" text-anchor="middle">t4</text>
+          <rect x="230" y="50" width="36" height="36" rx="4" fill="#8b5cf6" opacity=".85"/><text x="242" y="73" fill="#fff" text-anchor="middle">t5</text>
+          <rect x="268" y="50" width="36" height="36" rx="4" fill="#8b5cf6" opacity=".85"/><text x="280" y="73" fill="#fff" text-anchor="middle">t6</text>
+          <rect x="306" y="50" width="36" height="36" rx="4" fill="#8b5cf6" opacity=".85"/><text x="318" y="73" fill="#fff" text-anchor="middle">t7</text>
+          <rect x="354" y="50" width="36" height="36" rx="4" fill="#2dd4bf" opacity=".85"/><text x="366" y="73" fill="#052620" text-anchor="middle">t8</text>
+          <rect x="392" y="50" width="36" height="36" rx="4" fill="#2dd4bf" opacity=".85"/><text x="404" y="73" fill="#052620" text-anchor="middle">t9</text>
+        </g>
+        <text x="30" y="110" class="svg-sub">逻辑块 0</text>
+        <text x="192" y="110" class="svg-sub">逻辑块 1</text>
+        <text x="354" y="110" class="svg-sub">逻辑块 2（未填满）</text>
+      </g>
+      <!-- 页表 -->
+      <text x="30" y="160" class="svg-title">BlockTable 页表（逻辑 → 物理）</text>
+      <g>
+        <rect x="30" y="175" width="90" height="34" rx="6" fill="#1c2940" stroke="#33465f"/><text x="75" y="197" class="svg-label" text-anchor="middle">0 → #3</text>
+        <rect x="130" y="175" width="90" height="34" rx="6" fill="#1c2940" stroke="#33465f"/><text x="175" y="197" class="svg-label" text-anchor="middle">1 → #1</text>
+        <rect x="230" y="175" width="90" height="34" rx="6" fill="#1c2940" stroke="#33465f"/><text x="275" y="197" class="svg-label" text-anchor="middle">2 → #7</text>
+      </g>
+      <text x="340" y="197" class="svg-sub">tokenIdx=6 ⇒ 逻辑块 6/4=1，槽位 6%4=2 ⇒ 物理块 #1 第 2 槽</text>
+      <!-- 物理块池 -->
+      <text x="30" y="260" class="svg-title">BlockPool 物理块池（模拟 GPU 显存）</text>
+      <g>
+        <rect x="30"  y="275" width="70" height="34" rx="6" fill="#101827" stroke="#33465f"/><text x="65" y="297" class="svg-sub" text-anchor="middle">空闲 0</text>
+        <rect x="110" y="275" width="70" height="34" rx="6" fill="#8b5cf6" opacity=".75"/><text x="145" y="297" fill="#fff" text-anchor="middle" font-size="12">块 #1</text>
+        <rect x="190" y="275" width="70" height="34" rx="6" fill="#101827" stroke="#33465f"/><text x="225" y="297" class="svg-sub" text-anchor="middle">空闲 2</text>
+        <rect x="270" y="275" width="70" height="34" rx="6" fill="#4f8cff" opacity=".85"/><text x="305" y="297" fill="#fff" text-anchor="middle" font-size="12">块 #3</text>
+        <rect x="350" y="275" width="70" height="34" rx="6" fill="#101827" stroke="#33465f"/><text x="385" y="297" class="svg-sub" text-anchor="middle">空闲 4</text>
+        <rect x="430" y="275" width="70" height="34" rx="6" fill="#101827" stroke="#33465f"/><text x="465" y="297" class="svg-sub" text-anchor="middle">空闲 5</text>
+        <rect x="510" y="275" width="70" height="34" rx="6" fill="#101827" stroke="#33465f"/><text x="545" y="297" class="svg-sub" text-anchor="middle">空闲 6</text>
+        <rect x="590" y="275" width="70" height="34" rx="6" fill="#2dd4bf" opacity=".8"/><text x="625" y="297" fill="#052620" text-anchor="middle" font-size="12">块 #7</text>
+      </g>
+      <!-- 映射箭头 -->
+      <g stroke="#f59e0b" stroke-width="1.5" fill="none" marker-end="url(#ar4)">
+        <path d="M 148 86 C 200 140, 260 240, 295 272"/>
+        <path d="M 250 86 C 240 150, 170 240, 150 272"/>
+        <path d="M 372 86 C 450 150, 580 240, 618 272"/>
+      </g>
+      <!-- 右侧说明 -->
+      <g>
+        <rect x="700" y="50" width="220" height="250" rx="12" fill="#101827" stroke="#223047"/>
+        <text x="718" y="80" class="svg-title">三个核心类</text>
+        <text x="718" y="108" class="svg-sub" fill="#cfe0ff">BlockPool</text>
+        <text x="718" y="126" class="svg-sub">等大 KVBlock + freeList + 引用计数</text>
+        <text x="718" y="152" class="svg-sub" fill="#cfe0ff">BlockTable</text>
+        <text x="718" y="170" class="svg-sub">物理块 id 列表（每请求每层一张）</text>
+        <text x="718" y="196" class="svg-sub" fill="#cfe0ff">KVCacheManager</text>
+        <text x="718" y="214" class="svg-sub">按需分配 / 读写 KV / 释放 / 前缀共享</text>
+        <text x="718" y="244" class="svg-sub">分配返回 -1 = 显存不足信号，</text>
+        <text x="718" y="262" class="svg-sub">调度器据此暂停接纳新请求。</text>
+      </g>
+    </svg>
+    <div class="fig-caption">图 4-2　逻辑 KV 序列 → BlockTable 页表 → 物理块池的映射关系</div>
+  </div>
+
+  <h3>decode 阶段：逐 block 累加模拟 PagedAttention kernel</h3>
+  <p>生成阶段只有一个新 token 的 Q，历史 K/V 散落在物理块中。<a class="src" href="../src/main/java/io/leavesfly/minivllm/model/Qwen3Attention.java"><code>Qwen3Attention.decodePaged</code></a>
+  遍历该请求的每个逻辑块做两遍累加——第一遍收集全部 QKᵀ 得分后 softmax，第二遍按权重累加 V：</p>
+  <pre><code>for (int h = 0; h &lt; nHead; h++) {
+    int kvOff = (h / group) * headDim;       // GQA：Q 头 h 读 KV 头 h/group
+    // 第一遍：逐 block 算 attention score
+    for (int b = 0; b &lt; nBlocks; b++) {
+        float[] kBlk = kvMgr.blockK(bt, b);   // 零拷贝拿物理块的 K 数组
+        ... 对块内每个有效 token 累加 q·k ...
+    }
+    Softmax.softmaxInPlace(scores);
+    // 第二遍：逐 block 加权累加 V
+    for (int b = 0; b &lt; nBlocks; b++) { ... out += score * vBlk[...] ... }
+}</code></pre>
+  <div class="note"><b>三个关键细节</b>：① 真实 CUDA kernel 用 online-softmax 单遍完成，这里为可读性拆成两遍；
+  ② 最后一个 block 可能没填满，<code>tokensInBlock</code> 按 <code>totalTokens − b×blockSize</code> 截断；
+  ③ GQA 下每 token 只存 <code>kvDim = nKVHead × headDim</code>（Qwen3-0.6B 为 1024 而非 qDim 2048），显存与带宽都省 group 倍。</div>
+
+  <h3>前缀共享：引用计数的用武之地</h3>
+  <p>多个请求若含相同 token 前缀（如相同 system prompt），<code>KVCacheManager.trySharePrefix</code>
+  按 block 级内容指纹（<code>h = h*131 + token</code> 滚动哈希）命中已缓存块，
+  <code>pool.retain(id)</code> 引用 +1 直接复用，省去这部分 prefill 的计算与存储。
+  真实 vLLM 用 RadixAttention 前缀树精确匹配；学习版简化为哈希映射，
+  且当前引擎走全量 prefill 路径，前缀共享是内存层已就绪的能力接口（见 §⑫ 扩展方向）。</p>
+</section>
+
+<!-- ═══════════════════ §5 Continuous Batching ═══════════════════ -->
+<section id="batching">
+  <span class="sec-tag">Core Mechanism Ⅱ</span>
+  <h2>⑤ Continuous Batching：请求随时进出，batch 始终填满</h2>
+  <p class="sec-desc">
+    静态批处理必须等整批全部完成才能返回、才能接新请求，短请求早早算完却要空等最长的那个。
+    Continuous Batching 把调度粒度降到<b>每生成一个 token</b>：每一步都重新组织当前 batch，
+    完成的立刻退出、腾出的资源立刻接纳新请求——这是 vLLM 高吞吐的另一半。
+  </p>
+
+  <div class="figure">
+    <svg viewBox="0 0 940 350" width="940" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="静态批处理与连续批处理时间线对比">
+      <!-- 静态 -->
+      <text x="30" y="30" class="svg-title">静态批处理（static batching）</text>
+      <g font-size="12">
+        <text x="30" y="62" class="svg-sub">请求 A</text><rect x="90" y="48" width="180" height="22" rx="4" fill="#4f8cff" opacity=".85"/><rect x="270" y="48" width="180" height="22" rx="4" fill="#3b1f2b" stroke="#fb7185" stroke-dasharray="4 3"/>
+        <text x="30" y="92" class="svg-sub">请求 B</text><rect x="90" y="78" width="300" height="22" rx="4" fill="#8b5cf6" opacity=".85"/><rect x="390" y="78" width="60" height="22" rx="4" fill="#3b1f2b" stroke="#fb7185" stroke-dasharray="4 3"/>
+        <text x="30" y="122" class="svg-sub">请求 C</text><rect x="90" y="108" width="360" height="22" rx="4" fill="#2dd4bf" opacity=".8"/>
+        <text x="30" y="152" class="svg-sub">请求 D</text><rect x="450" y="138" width="160" height="22" rx="4" fill="#f59e0b" opacity=".7"/><text x="465" y="154" fill="#3b2503">被整批锁定挡在门外</text>
+        <line x1="450" y1="42" x2="450" y2="166" stroke="#fb7185" stroke-width="1.5" stroke-dasharray="4 3"/>
+        <text x="456" y="56" class="svg-sub" fill="#fb7185">整批返回点</text>
+      </g>
+      <text x="30" y="188" class="svg-sub" fill="#fb7185">✗ 红色区域 = 已完成请求的空转等待；✗ 新请求必须等整批结束</text>
+
+      <!-- 连续 -->
+      <text x="30" y="228" class="svg-title">Continuous Batching（每步重组 batch）</text>
+      <g font-size="12">
+        <text x="30" y="260" class="svg-sub">请求 A</text><rect x="90" y="246" width="150" height="22" rx="4" fill="#4f8cff" opacity=".85"/>
+        <text x="30" y="290" class="svg-sub">请求 B</text><rect x="90" y="276" width="260" height="22" rx="4" fill="#8b5cf6" opacity=".85"/>
+        <text x="30" y="320" class="svg-sub">请求 C</text><rect x="90" y="306" width="360" height="22" rx="4" fill="#2dd4bf" opacity=".8"/>
+        <text x="30" y="230" class="svg-sub"></text>
+        <rect x="246" y="246" width="204" height="22" rx="4" fill="#f59e0b" opacity=".75"/><text x="256" y="262" fill="#3b2503">请求 D 立即顶上 A 的位置</text>
+      </g>
+      <text x="480" y="322" class="svg-sub" fill="#34d399">✓ A 完成即退出，下一个 step 就接纳 D —— batch 始终填满</text>
+    </svg>
+    <div class="fig-caption">图 5-1　静态批处理的空转（上） vs Continuous Batching 的动态组批（下）</div>
+  </div>
+
+  <h3>三段循环：admit → decode → sweep</h3>
+  <p>核心在 <a class="src" href="../src/main/java/io/leavesfly/minivllm/core/LLMEngine.java"><code>LLMEngine.step()</code></a>，
+  一个调度周期即三步。<a class="src" href="../src/main/java/io/leavesfly/minivllm/core/Scheduler.java"><code>Scheduler</code></a>
+  维护 waiting（并发队列，HTTP 线程随时写）与 running（引擎线程独占）两个队列；
+  <a class="src" href="../src/main/java/io/leavesfly/minivllm/core/Sequence.java"><code>Sequence</code></a>
+  是请求的完整运行时状态：<code>WAITING → PREFILL → DECODE → FINISHED / ABORTED</code>。</p>
+
+  <div class="figure">
+    <svg viewBox="0 0 940 260" width="940" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="三段循环示意">
+      <defs><marker id="ar5" markerWidth="9" markerHeight="9" refX="7" refY="3.5" orient="auto"><path d="M0,0 L7,3.5 L0,7 z" fill="#8b5cf6"/></marker></defs>
+      <!-- waiting -->
+      <rect x="30" y="80" width="150" height="90" rx="12" fill="#1c2940" stroke="#4f8cff" stroke-width="1.4"/>
+      <text x="105" y="112" class="svg-title" text-anchor="middle">waiting</text>
+      <text x="105" y="134" class="svg-sub" text-anchor="middle">ConcurrentLinkedDeque</text>
+      <text x="105" y="152" class="svg-sub" text-anchor="middle">待 prefill 的请求</text>
+      <!-- step loop -->
+      <rect x="270" y="40" width="380" height="170" rx="14" fill="#171225" stroke="#8b5cf6" stroke-width="1.6"/>
+      <text x="460" y="66" class="svg-title" text-anchor="middle">LLMEngine.step()　一个调度周期</text>
+      <rect x="292" y="82" width="104" height="56" rx="9" fill="#4f8cff" opacity=".9"/>
+      <text x="344" y="106" fill="#fff" font-size="13" text-anchor="middle" font-weight="700">① admit</text>
+      <text x="344" y="126" fill="#dbeafe" font-size="10.5" text-anchor="middle">prefill + 首 token</text>
+      <rect x="408" y="82" width="104" height="56" rx="9" fill="#8b5cf6" opacity=".9"/>
+      <text x="460" y="106" fill="#fff" font-size="13" text-anchor="middle" font-weight="700">② decode</text>
+      <text x="460" y="126" fill="#ede9fe" font-size="10.5" text-anchor="middle">每个请求走一步</text>
+      <rect x="524" y="82" width="104" height="56" rx="9" fill="#2dd4bf" opacity=".9"/>
+      <text x="576" y="106" fill="#052620" font-size="13" text-anchor="middle" font-weight="700">③ sweep</text>
+      <text x="576" y="126" fill="#0f3d36" font-size="10.5" text-anchor="middle">清扫 + 释放 KV</text>
+      <g stroke="#c4b5fd" stroke-width="1.4" fill="none" marker-end="url(#ar5)">
+        <line x1="396" y1="110" x2="406" y2="110"/>
+        <line x1="512" y1="110" x2="522" y2="110"/>
+      </g>
+      <text x="460" y="172" class="svg-sub" text-anchor="middle">admit 受双重约束：running.size() &lt; maxNumSeqs 且各层 KV 分配成功</text>
+      <text x="460" y="192" class="svg-sub" text-anchor="middle">分配失败 → 回滚已分配 block，留在 waiting 下次再试（避免半分配泄漏）</text>
+      <!-- running -->
+      <rect x="740" y="80" width="160" height="90" rx="12" fill="#171225" stroke="#8b5cf6" stroke-width="1.4"/>
+      <text x="820" y="112" class="svg-title" text-anchor="middle">running</text>
+      <text x="820" y="134" class="svg-sub" text-anchor="middle">ArrayList（引擎独占）</text>
+      <text x="820" y="152" class="svg-sub" text-anchor="middle">正在 decode 的请求</text>
+      <!-- 箭头 -->
+      <g stroke="#4f8cff" stroke-width="1.8" fill="none" marker-end="url(#ar5)">
+        <line x1="180" y1="125" x2="268" y2="125"/>
+      </g>
+      <g stroke="#8b5cf6" stroke-width="1.8" fill="none" marker-end="url(#ar5)">
+        <line x1="650" y1="110" x2="738" y2="110"/>
+      </g>
+      <!-- 闭环 -->
+      <path d="M 820 172 C 820 230, 105 230, 105 172" stroke="#34d399" stroke-width="1.5" fill="none" stroke-dasharray="5 4"/>
+      <text x="460" y="244" class="svg-sub" fill="#34d399" text-anchor="middle">完成请求释放的 KV block 立刻回到 freeList —— 下一个 step 的 admit 就能拿去给新请求用（与 PagedAttention 的协同闭环）</text>
+    </svg>
+    <div class="fig-caption">图 5-2　admit → decode → sweep 三段循环与 waiting/running 双队列</div>
+  </div>
+
+  <h3>emitToken：流式输出的两个细节</h3>
+  <ul>
+    <li><b>EOS 不外泄</b>：命中停止 token 时直接 return，不把 <code>&lt;|im_end|&gt;</code> 等特殊 token 解码成文本，否则会污染响应与多轮 ChatML 上下文。</li>
+    <li><b>增量解码</b>：BPE 分词下，中文/emoji 的多字节 UTF-8 可能被切在两个 token 里，<code>IncrementalDecoder</code> 缓冲不完整字节，只输出可完整解码的片段，避免流式乱码 <code>?</code>。</li>
+  </ul>
+
+  <h3>一个具象例子（maxNumSeqs = 2，提交 5 个请求）</h3>
+  <pre><code>step 1:   admit R0,R1（并发满），各 prefill 出首 token；R2~R4 在 waiting 等
+step 2~k: R0,R1 各 decode 1 token
+step k:   R0 命中 EOS → sweep 释放其 KV block → running=[R1]
+step k+1: admit R2（复用 R0 释放的 block）→ running=[R1,R2]
+...
+最终:     5 个请求全部完成，running 清空（LLMEngineE2ETest 验证此场景）</code></pre>
+  <div class="note"><b>与真实 vLLM 的差异</b>：decode 途中显存不足时，学习版直接置 <code>ABORTED</code> 不做抢占；
+  真实 vLLM 会 preemption（把某些请求的 KV cache swap 到 CPU 或 recompute）。多请求 decode 也是逐个串行前向，
+  而非真正的 batched GEMM。</div>
+</section>
+
+<!-- ═══════════════════ §6 Transformer ═══════════════════ -->
+<section id="transformer">
+  <span class="sec-tag">Model Computation</span>
+  <h2>⑥ Transformer：Qwen3 五大特性的纯 Java 实现</h2>
+  <p class="sec-desc">
+    mini-vllm 有两套平行的 <code>LlmModel</code> 实现：
+    <a class="src" href="../src/main/java/io/leavesfly/minivllm/model/Qwen3Model.java"><code>Qwen3Model</code></a>
+    （RMSNorm + RoPE + GQA + SwiGLU + QK-Norm，真实对话）与
+    <a class="src" href="../src/main/java/io/leavesfly/minivllm/model/TransformerModel.java"><code>TransformerModel</code></a>
+    （LayerNorm + 学习式位置嵌入 + MHA + GELU-MLP 的 GPT-2/3 微模型，无权重验证流程用）。
+    两者共享同一套 math 算子与 PagedAttention KV cache。
+  </p>
+
+  <h3>Qwen3Block：pre-norm 残差结构</h3>
+  <div class="figure">
+    <svg viewBox="0 0 940 400" width="940" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Qwen3 前向结构图">
+      <defs><marker id="ar6" markerWidth="9" markerHeight="9" refX="7" refY="3.5" orient="auto"><path d="M0,0 L7,3.5 L0,7 z" fill="#4f8cff"/></marker></defs>
+      <!-- 左：整体流程 -->
+      <g>
+        <rect x="40" y="20" width="240" height="44" rx="9" fill="#1c2940" stroke="#4f8cff"/>
+        <text x="160" y="47" class="svg-label" text-anchor="middle">tokens → embed_tokens 查表</text>
+        <line x1="160" y1="64" x2="160" y2="84" stroke="#4f8cff" stroke-width="1.6" marker-end="url(#ar6)"/>
+        <rect x="40" y="88" width="240" height="150" rx="9" fill="#171225" stroke="#8b5cf6" stroke-width="1.5"/>
+        <text x="160" y="114" class="svg-title" text-anchor="middle">Qwen3Block × 28</text>
+        <text x="60" y="142" class="svg-sub">x = x + Attention(RmsNorm(x))</text>
+        <text x="60" y="164" class="svg-sub">x = x + SwiGLU(RmsNorm(x))</text>
+        <text x="60" y="196" class="svg-sub" fill="#a78bfa">无 wpe 位置嵌入 ——</text>
+        <text x="60" y="214" class="svg-sub" fill="#a78bfa">位置信息由注意力内部的 RoPE 提供</text>
+        <line x1="160" y1="238" x2="160" y2="258" stroke="#4f8cff" stroke-width="1.6" marker-end="url(#ar6)"/>
+        <rect x="40" y="262" width="240" height="44" rx="9" fill="#1c2940" stroke="#4f8cff"/>
+        <text x="160" y="289" class="svg-label" text-anchor="middle">最终 RmsNorm</text>
+        <line x1="160" y1="306" x2="160" y2="326" stroke="#4f8cff" stroke-width="1.6" marker-end="url(#ar6)"/>
+        <rect x="40" y="330" width="240" height="44" rx="9" fill="#123029" stroke="#2dd4bf"/>
+        <text x="160" y="357" class="svg-label" text-anchor="middle">logits = x · embed_tokensᵀ（tied lm_head）</text>
+      </g>
+      <!-- 右：注意力内部 -->
+      <g>
+        <rect x="360" y="20" width="540" height="354" rx="12" fill="#101827" stroke="#223047"/>
+        <text x="630" y="50" class="svg-title" text-anchor="middle">Qwen3Attention 内部（per token / per block）</text>
+        <!-- q k v -->
+        <rect x="390" y="70" width="110" height="40" rx="8" fill="#4f8cff" opacity=".9"/><text x="445" y="95" fill="#fff" font-size="12.5" text-anchor="middle">q_proj [qDim]</text>
+        <rect x="520" y="70" width="110" height="40" rx="8" fill="#8b5cf6" opacity=".9"/><text x="575" y="95" fill="#fff" font-size="12.5" text-anchor="middle">k_proj [kvDim]</text>
+        <rect x="650" y="70" width="110" height="40" rx="8" fill="#8b5cf6" opacity=".9"/><text x="705" y="95" fill="#fff" font-size="12.5" text-anchor="middle">v_proj [kvDim]</text>
+        <line x1="445" y1="110" x2="445" y2="132" stroke="#4f8cff" stroke-width="1.5" marker-end="url(#ar6)"/>
+        <line x1="575" y1="110" x2="575" y2="132" stroke="#8b5cf6" stroke-width="1.5" marker-end="url(#ar6)"/>
+        <!-- qk norm -->
+        <rect x="390" y="136" width="240" height="40" rx="8" fill="#33240f" stroke="#f59e0b"/>
+        <text x="510" y="161" fill="#fbbf24" font-size="12.5" text-anchor="middle">① QK-Norm：逐头 RMSNorm（顺序不能反）</text>
+        <line x1="510" y1="176" x2="510" y2="198" stroke="#f59e0b" stroke-width="1.5" marker-end="url(#ar6)"/>
+        <rect x="390" y="202" width="240" height="40" rx="8" fill="#33240f" stroke="#f59e0b"/>
+        <text x="510" y="227" fill="#fbbf24" font-size="12.5" text-anchor="middle">② RoPE 旋转位置编码（只作用 Q/K）</text>
+        <line x1="510" y1="242" x2="510" y2="264" stroke="#f59e0b" stroke-width="1.5" marker-end="url(#ar6)"/>
+        <!-- kv cache -->
+        <rect x="700" y="136" width="180" height="106" rx="8" fill="#123029" stroke="#2dd4bf" stroke-dasharray="5 4"/>
+        <text x="790" y="164" fill="#5eead4" font-size="12.5" text-anchor="middle">KV cache 落位</text>
+        <text x="790" y="186" class="svg-sub" text-anchor="middle">writeKV(bt, pos, k, v)</text>
+        <text x="790" y="206" class="svg-sub" text-anchor="middle">decode 时经 PagedAttention</text>
+        <text x="790" y="224" class="svg-sub" text-anchor="middle">逐 block 读回历史 K/V</text>
+        <line x1="705" y1="110" x2="760" y2="134" stroke="#2dd4bf" stroke-width="1.4" stroke-dasharray="4 3"/>
+        <!-- attention -->
+        <rect x="390" y="268" width="490" height="40" rx="8" fill="#4f8cff" opacity=".85"/>
+        <text x="635" y="293" fill="#fff" font-size="12.5" text-anchor="middle">③ Attention：score = softmax(QKᵀ/√d) · V，Q 头 h 读 KV 头 h/group</text>
+        <line x1="635" y1="308" x2="635" y2="328" stroke="#4f8cff" stroke-width="1.5" marker-end="url(#ar6)"/>
+        <rect x="390" y="332" width="490" height="32" rx="8" fill="#1c2940" stroke="#4f8cff"/>
+        <text x="635" y="353" class="svg-label" text-anchor="middle">o_proj：qDim(2048) → dModel(1024)</text>
+      </g>
+    </svg>
+    <div class="fig-caption">图 6-1　Qwen3 整体前向（左）与注意力子层内部（右）：Norm → RoPE 的顺序是数值对齐的关键</div>
+  </div>
+
+  <h3>五大特性速览</h3>
+  <table>
+    <tr><th>特性</th><th>要点</th><th>易踩的坑</th></tr>
+    <tr><td><b>RMSNorm</b></td><td><code>y = x / √(mean(x²)+ε) · γ</code>，不减均值无 bias；带 offset 版本为逐头 QK-Norm 服务</td><td>—</td></tr>
+    <tr><td><b>RoPE</b></td><td>headDim 维按<b>前半/后半配对</b>（half-split），每对在二维平面旋转 <code>pos·θ^(−2i/d)</code>；cos/sin 表全 28 层共享</td><td>Qwen 用 half-split 而非 GPT-J 交错式 —— 与 HF 对齐最常见的错误来源；只旋转 Q/K 不旋转 V</td></tr>
+    <tr><td><b>GQA</b></td><td>16 个 Q 头共享 8 个 KV 头（group=2）；KV cache 每 token 只存 kvDim=1024 而非 qDim=2048</td><td>qDim ≠ dModel（headDim 是独立超参 128）</td></tr>
+    <tr><td><b>QK-Norm</b></td><td>Q/K 投影后先按头 RMSNorm 再施加 RoPE，稳定注意力 logits</td><td>顺序反了与 HF 数值不一致</td></tr>
+    <tr><td><b>SwiGLU</b></td><td><code>down( silu(gate(x)) ⊙ up(x) )</code>，三路无 bias 线性层，dFfn=3072 ≈ 3×dModel</td><td>比 GPT-2 的 GELU-MLP 多一路 gate 投影</td></tr>
+  </table>
+
+  <h3>热点算子：SIMD + 行并行的 Matmul</h3>
+  <p>decode 阶段每步要把全模型权重过一遍，<a class="src" href="../src/main/java/io/leavesfly/minivllm/math/Matmul.java"><code>Matmul.matVec</code></a>
+  是最热的算子：把权重每行与激活向量做点积，<b>按输出行分块并行</b>（固定线程池，按 CPU 核数），
+  行内点积交给 <a class="src" href="../src/main/java/io/leavesfly/minivllm/math/DotKernel.java"><code>DotKernel</code></a>
+  —— 运行时探测 JDK Vector API（incubator），有则用 <code>VectorDotKernel</code>（SPECIES_PREFERRED lane 分块 fma 累加），缺失自动回退标量实现，功能完全不变。</p>
+
+  <h3>数值对齐：与 HuggingFace 逐层比对</h3>
+  <p><a class="src" href="../src/test/java/io/leavesfly/minivllm/model/Qwen3AlignmentTest.java"><code>Qwen3AlignmentTest</code></a>
+  加载真实权重，用 <code>tools/dump_reference.py</code> 从 HF transformers（F32 eager）导出的参考数据逐项比对：</p>
+  <table>
+    <tr><th>对齐项</th><th>判据</th></tr>
+    <tr><td>ChatML 模板字符串 / BPE 分词 ids</td><td>与 HF 完全一致</td></tr>
+    <tr><td>第 0/1 层 block 输出 hidden</td><td>maxAbs &lt; 2e-2</td></tr>
+    <tr><td>final norm 后 hidden / 最后位置 logits</td><td>maxAbs &lt; 5e-3 / &lt; 0.2 且 top-5 一致</td></tr>
+    <tr><td><b>greedy 生成 32~80 token</b></td><td><b>与 HF 逐 token 完全一致</b>（终极标准；Qwen3-0.6B 与 Llama-3.2-1B 均验证）</td></tr>
+  </table>
+</section>
+
+<!-- ═══════════════════ §7 KV Cache 内存 ═══════════════════ -->
+<section id="kvcache">
+  <span class="sec-tag">Memory Management</span>
+  <h2>⑦ KV Cache 内存管理：按需分配、引用计数回收</h2>
+  <p class="sec-desc">
+    §④ 讲「attention 怎么用 cache」，这里讲「cache 的内存怎么管」。
+    三个设计支柱：<b>按需分配</b>（只在容量不足时申请新块）、<b>懒创建</b>（块数组首次 allocate 才创建）、
+    <b>引用计数回收</b>（归零才真正归还，支持共享；LIFO 归还利于缓存局部性）。
+  </p>
+
+  <div class="grid-2">
+    <div class="card">
+      <h4 style="margin-bottom:10px">按需分配 ensureCapacity</h4>
+<pre><code>int needed = (requiredTokens + blockSize - 1) / blockSize;
+while (bt.numBlocks() < needed) {
+    int id = pool.allocate();
+    if (id < 0) return false;  // 池满 → 调度器阻塞新请求
+    bt.append(id);
+}</code></pre>
+      <p style="font-size:13.5px;color:var(--muted)">prefill 按 promptLen 分配，decode 按 curIdx+1 增量扩容。返回 false 是显存不足信号：admit 时回滚等待，decode 时置 ABORTED。</p>
+    </div>
+    <div class="card">
+      <h4 style="margin-bottom:10px">引用计数回收 release</h4>
+<pre><code>KVBlock b = blocks[blockId];
+b.refCount--;
+if (b.refCount == 0) {
+    freeList.addFirst(blockId);  // LIFO 归还
+    usedBlocks--;
+} else if (b.refCount < 0)
+    throw new IllegalStateException("引用计数下溢");</code></pre>
+      <p style="font-size:13.5px;color:var(--muted)">共享块（前缀共享）被多请求指向时，只有最后一个释放才回收；下溢直接抛异常，帮学习期尽早暴露重复释放 bug。</p>
+    </div>
+  </div>
+
+  <h3>显存占用估算（Qwen3-0.6B 默认参数）</h3>
+  <pre><code>bytes     = numBlocks × blockSize × kvDim × 2(K和V) × 4(float)
+blocksPerSeq = ceil(maxSeqLen / blockSize)          = ceil(2048/16) = 128
+numBlocks    = max(1024, maxNumSeqs × nLayer × blocksPerSeq) = max(1024, 2×28×128) = 7168
+单块 = 16×1024×2×4 = 128 KB  ⇒  总计约 7168 × 128 KB ≈ 0.9 GB（满并发不 OOM）</code></pre>
+  <p style="color:var(--muted);font-size:14px">注意 KV cache <b>按层独立</b>（每层一张 BlockTable），所以公式乘 nLayer。想降内存可调小 <code>--max-seq-len</code>、<code>--max-seqs</code> 或 <code>--num-blocks</code>，或用 <code>--kv-cache-dtype int8</code> 把容量与带宽降到约 1/4。</p>
+</section>
+
+<!-- ═══════════════════ §8 权重加载 ═══════════════════ -->
+<section id="weights">
+  <span class="sec-tag">Weight Loading</span>
+  <h2>⑧ 权重加载：safetensors 解析、五种精度、自动下载</h2>
+  <p class="sec-desc">
+    PyTorch 的 <code>.pt/.bin</code> 是 pickle 格式，纯 Java 几乎无法安全解析；而 <b>safetensors</b>
+    用「明文 JSON header + 裸张量数据」，格式极简，非常适合零依赖解析——这正是项目选它作为权重载体的原因。
+  </p>
+
+  <div class="figure">
+    <svg viewBox="0 0 940 250" width="940" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="safetensors 文件格式">
+      <!-- 文件布局 -->
+      <text x="30" y="30" class="svg-title">safetensors 文件布局</text>
+      <rect x="30" y="48" width="90" height="56" rx="6" fill="#1c2940" stroke="#4f8cff"/>
+      <text x="75" y="72" class="svg-sub" text-anchor="middle" fill="#cfe0ff">8 字节</text>
+      <text x="75" y="90" class="svg-sub" text-anchor="middle">header 长度 N</text>
+      <rect x="128" y="48" width="240" height="56" rx="6" fill="#241a35" stroke="#8b5cf6"/>
+      <text x="248" y="72" class="svg-sub" text-anchor="middle" fill="#c4b5fd">N 字节 header JSON</text>
+      <text x="248" y="90" class="svg-sub" text-anchor="middle">{name: {dtype, shape, data_offsets}}</text>
+      <rect x="376" y="48" width="240" height="56" rx="6" fill="#123029" stroke="#2dd4bf"/>
+      <text x="496" y="72" class="svg-sub" text-anchor="middle" fill="#5eead4">裸张量数据区</text>
+      <text x="496" y="90" class="svg-sub" text-anchor="middle">按 data_offsets 定位（8 字节对齐）</text>
+      <!-- 读取策略 -->
+      <g>
+        <rect x="640" y="48" width="270" height="56" rx="8" fill="#101827" stroke="#223047"/>
+        <text x="656" y="72" class="svg-sub" fill="#cfe0ff">读取策略：FileChannel 按 tensor 分段读，</text>
+        <text x="656" y="90" class="svg-sub">每 tensor 再按 4MB 块流式读取并即时转 F32</text>
+      </g>
+      <text x="30" y="134" class="svg-sub">✓ 规避 Java byte[] 的 2GB 上限（权重约 1.5GB）；✓ 内存峰值从「文件两倍」降到「单个 tensor 两倍」</text>
+      <!-- dtype -->
+      <text x="30" y="172" class="svg-title">支持的 dtype 与转换</text>
+      <g>
+        <rect x="30" y="188" width="270" height="48" rx="8" fill="#1c2940" stroke="#33465f"/>
+        <text x="46" y="210" class="svg-label">F32</text>
+        <text x="46" y="228" class="svg-sub">4 字节直读</text>
+        <rect x="320" y="188" width="290" height="48" rx="8" fill="#241a35" stroke="#8b5cf6"/>
+        <text x="336" y="210" class="svg-label">BF16（Qwen3 权重格式）</text>
+        <text x="336" y="228" class="svg-sub">1符号+8指数+7尾数 → 左移 16 位即得 F32</text>
+        <rect x="630" y="188" width="280" height="48" rx="8" fill="#33240f" stroke="#f59e0b"/>
+        <text x="646" y="210" class="svg-label">F16</text>
+        <text x="646" y="228" class="svg-sub">1符号+5指数+10尾数 → 按位重建（偏置 15→127）</text>
+      </g>
+    </svg>
+    <div class="fig-caption">图 8-1　safetensors 文件布局、分段读取策略与 BF16/F16 → F32 转换</div>
+  </div>
+
+  <h3>五种权重常驻精度</h3>
+  <table>
+    <tr><th>精度</th><th>常驻方式</th><th>堆需求（Qwen3-0.6B）</th><th>适用场景</th></tr>
+    <tr><td><code>f32</code></td><td>BF16→F32 展开进堆</td><td>约 3GB（磁盘的两倍）</td><td>默认，数值精度最高</td></tr>
+    <tr><td><code>bf16</code></td><td>short[] 位表示常驻堆，SIMD 直接消费</td><td>约 1.5GB</td><td>0.6B 小模型在 Apple Silicon 上实测最快</td></tr>
+    <tr><td><code>int8 / int4</code></td><td>per-group 对称量化块常驻堆</td><td>约 0.7GB / 0.4GB</td><td>4B+ 大模型的内存可行性</td></tr>
+    <tr><td><code>mmap</code></td><td><b>权重不落堆</b>：FileChannel.map 映射进地址空间，OS 按需调页</td><td>数百 MB（行缓冲 + KV）</td><td>物理内存装不下模型时（512MB 堆即可跑 1.5GB 模型）</td></tr>
+  </table>
+
+  <h3>mmap 模式：页缓存承载权重</h3>
+  <p><a class="src" href="../src/main/java/io/leavesfly/minivllm/weights/MmapWeights.java"><code>MmapWeights.open</code></a>
+  对每个 safetensors 分片调用一次 <code>FileChannel.map(READ_ONLY, 0, size)</code>——只建页表不读数据，
+  1.5GB 模型映射耗时 0.0s；之后每次访问触发缺页中断，OS 从磁盘调入 4KB 页进页缓存，内存紧张时自行回收冷页。
+  这正是 llama.cpp / vLLM 加载大模型的方式。</p>
+
+  <div class="figure">
+    <svg viewBox="0 0 940 240" width="940" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="mmap 权重加载数据流">
+      <defs><marker id="ar7" markerWidth="9" markerHeight="9" refX="7" refY="3.5" orient="auto"><path d="M0,0 L7,3.5 L0,7 z" fill="#2dd4bf"/></marker></defs>
+      <rect x="30" y="70" width="180" height="90" rx="10" fill="#1c2940" stroke="#4f8cff"/>
+      <text x="120" y="104" class="svg-title" text-anchor="middle">磁盘 safetensors</text>
+      <text x="120" y="126" class="svg-sub" text-anchor="middle">BF16 权重（唯一支持格式）</text>
+      <line x1="210" y1="115" x2="268" y2="115" stroke="#2dd4bf" stroke-width="1.8" marker-end="url(#ar7)"/>
+      <text x="239" y="105" class="svg-sub" text-anchor="middle">缺页调页 4KB</text>
+      <rect x="270" y="70" width="200" height="90" rx="10" fill="#123029" stroke="#2dd4bf"/>
+      <text x="370" y="100" class="svg-title" text-anchor="middle" fill="#a7ded4">OS 页缓存</text>
+      <text x="370" y="122" class="svg-sub" text-anchor="middle">MappedByteBuffer 映射区</text>
+      <text x="370" y="140" class="svg-sub" text-anchor="middle">ShortBuffer 视图（零拷贝）</text>
+      <line x1="470" y1="115" x2="528" y2="115" stroke="#2dd4bf" stroke-width="1.8" marker-end="url(#ar7)"/>
+      <text x="500" y="105" class="svg-sub" text-anchor="middle">整行 bulk get</text>
+      <rect x="530" y="70" width="200" height="90" rx="10" fill="#33240f" stroke="#f59e0b"/>
+      <text x="630" y="100" class="svg-title" text-anchor="middle" fill="#fbbf24">ThreadLocal 行缓冲</text>
+      <text x="630" y="122" class="svg-sub" text-anchor="middle">short[] 只增不缩，线程私有</text>
+      <text x="630" y="140" class="svg-sub" text-anchor="middle">保 SIMD + 线程安全</text>
+      <line x1="730" y1="115" x2="788" y2="115" stroke="#2dd4bf" stroke-width="1.8" marker-end="url(#ar7)"/>
+      <rect x="790" y="70" width="130" height="90" rx="10" fill="#241a35" stroke="#8b5cf6"/>
+      <text x="855" y="104" class="svg-title" text-anchor="middle" fill="#c4b5fd">SIMD 内核</text>
+      <text x="855" y="126" class="svg-sub" text-anchor="middle">KERNEL.dotBf16</text>
+      <text x="855" y="144" class="svg-sub" text-anchor="middle">与堆内路径同一份</text>
+      <text x="30" y="200" class="svg-sub">核心取舍：Vector API 只接受 Java 数组，故用「行拷贝」而非逐元素读 —— 输出与堆内 bf16 bitwise 一致；mmap 模式下 fusedQKV 退化为三路独立投影，避免权重物化回堆。</text>
+      <text x="30" y="224" class="svg-sub">实测（Apple Silicon，页缓存热后）：bf16 堆内 ~35 tok/s vs mmap ~23 tok/s，换来的是加载 0.0s 与堆需求从 ~3GB 降到数百 MB。</text>
+    </svg>
+    <div class="fig-caption">图 8-2　mmap 权重数据流：磁盘 → 页缓存 → 行缓冲 → SIMD 内核</div>
+  </div>
+
+  <h3>加载即校验：三重防线</h3>
+  <ul>
+    <li><b>形状校验</b>：每个张量长度必须等于期望的 out×in（<code>Qwen3Loader.get</code>）；</li>
+    <li><b>全量消费</b>：所有张量必须被装配消费（tied 下容忍多余的 <code>lm_head.weight</code>）；</li>
+    <li><b>参数量校验</b>：<code>numParameters()</code> 必须与按配置公式计算的期望值一致（Qwen3-0.6B ≈ 596M）。</li>
+  </ul>
+
+  <h3>模型自动下载与多模型家族</h3>
+  <p><a class="src" href="../src/main/java/io/leavesfly/minivllm/weights/ModelDownloader.java"><code>ModelDownloader</code></a>
+  按四级顺序解析模型位置（命中即返回）：<b>项目内 <code>./models/&lt;name&gt;</code> → HF 缓存 → mini-vllm 本地缓存 → 在线下载</b>
+  （ModelScope 优先、HF 兜底）。可靠性设计：<code>.part</code> 临时文件 + 原子改名、<code>Range</code> 断点续传、
+  <code>.part.url</code> 记录来源镜像（跨镜像不续传避免损坏文件）。</p>
+  <p>模型家族通过 <a class="src" href="../src/main/java/io/leavesfly/minivllm/family/ModelFamily.java"><code>ModelFamily</code></a>
+  SPI 扩展（META-INF/services 注册）：当前支持 <code>Qwen3Family</code> 与 <code>LlamaFamily</code>——
+  家族差异收敛在 <code>ModelConfig</code>（qkNorm 按 model_type 判定、rope_scaling 解析 llama3 参数），
+  模型骨架复用同一套 <code>Qwen3Model/Qwen3Loader</code>。对话模板由 <code>JinjaChatTemplate</code>（jinja 子集解释器）
+  渲染模型自带 <code>chat_template</code>，与 jinja2 逐字符对齐。</p>
+</section>
+
+<!-- ═══════════════════ §9 OpenAI API ═══════════════════ -->
+<section id="api">
+  <span class="sec-tag">Service & API</span>
+  <h2>⑨ OpenAI 兼容 API、SSE 流式与 Web 对话页</h2>
+  <p class="sec-desc">
+    服务由 JDK 内置 <code>com.sun.net.httpserver.HttpServer</code> 零依赖实现，
+    接口完全兼容 OpenAI，官方 SDK 只需把 <code>base_url</code> 指向 <code>http://localhost:8080/v1</code> 即可。
+  </p>
+
+  <div class="grid-2">
+    <div>
+      <h3>端点总览</h3>
+      <table>
+        <tr><th>方法</th><th>路径</th><th>说明</th></tr>
+        <tr><td>POST</td><td><code>/v1/chat/completions</code></td><td>对话补全（流式/非流式）</td></tr>
+        <tr><td>POST</td><td><code>/v1/completions</code></td><td>文本补全</td></tr>
+        <tr><td>GET</td><td><code>/v1/models</code></td><td>模型列表（附 <code>loaded</code>/<code>default</code>）</td></tr>
+        <tr><td>GET</td><td><code>/</code></td><td>内置 Web 对话页（单页应用）</td></tr>
+      </table>
+      <h3>请求参数</h3>
+      <table>
+        <tr><th>参数</th><th>默认</th><th>说明</th></tr>
+        <tr><td><code>model</code></td><td>默认模型</td><td>模型目录名；<code>mini-vllm/default/auto</code> 走默认</td></tr>
+        <tr><td><code>max_tokens</code></td><td>2048</td><td>最大生成 token 数</td></tr>
+        <tr><td><code>temperature</code></td><td>0.8</td><td>≤1e-3 退化为 greedy</td></tr>
+        <tr><td><code>top_p</code> / <code>top_k</code></td><td>0.9 / 0</td><td>nucleus / top-k 采样</td></tr>
+        <tr><td><code>enable_thinking</code></td><td>false</td><td>Qwen3 思考模式开关</td></tr>
+      </table>
+    </div>
+    <div>
+      <h3>多模型路由（ModelHub）</h3>
+      <div class="card" style="margin-top:12px">
+        <ul style="font-size:14px">
+          <li>启动时扫描 <code>models/</code>，每个含 <code>config.json</code> 的子目录注册为可选模型；默认模型预热，其余<b>首次被请求时懒加载</b>。</li>
+          <li>每个模型独享一套 <code>ModelRuntime</code>：权重 + KVCacheManager + 已启动引擎；KV 池不可跨模型共享（kvDim 布局不兼容），不做换出。</li>
+          <li>Web 页头下拉框由 <code>/v1/models</code> 填充，选择存 localStorage；未加载模型标「待加载」。</li>
+        </ul>
+      </div>
+      <h3>思考模式的巧妙处理</h3>
+      <div class="card" style="margin-top:12px">
+        <p style="font-size:14px;margin:0"><code>enable_thinking=false</code>（默认）时，模板末尾<b>预填空</b>
+        <code>&lt;think&gt;
+
+&lt;/think&gt;
+
+</code>——模型跳过内部推理直接作答，
+        避免短请求被 max_tokens 截断在推理中途「看起来没回答」的经典踩坑。</p>
+      </div>
+    </div>
+  </div>
+
+  <h3>SSE 流式输出时序</h3>
+  <div class="figure">
+    <svg viewBox="0 0 940 300" width="940" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="SSE 流式时序图">
+      <defs><marker id="ar8" markerWidth="9" markerHeight="9" refX="7" refY="3.5" orient="auto"><path d="M0,0 L7,3.5 L0,7 z" fill="#4f8cff"/></marker>
+      <marker id="ar9" markerWidth="9" markerHeight="9" refX="7" refY="3.5" orient="auto"><path d="M0,0 L7,3.5 L0,7 z" fill="#2dd4bf"/></marker></defs>
+      <!-- 生命线 -->
+      <g>
+        <rect x="60" y="20" width="120" height="34" rx="8" fill="#1c2940" stroke="#4f8cff"/><text x="120" y="42" class="svg-label" text-anchor="middle">客户端</text>
+        <rect x="330" y="20" width="150" height="34" rx="8" fill="#241a35" stroke="#8b5cf6"/><text x="405" y="42" class="svg-label" text-anchor="middle">HTTP handler 线程</text>
+        <rect x="640" y="20" width="150" height="34" rx="8" fill="#171225" stroke="#8b5cf6"/><text x="715" y="42" class="svg-label" text-anchor="middle">引擎线程</text>
+        <line x1="120" y1="54" x2="120" y2="280" stroke="#33465f" stroke-dasharray="4 4"/>
+        <line x1="405" y1="54" x2="405" y2="280" stroke="#33465f" stroke-dasharray="4 4"/>
+        <line x1="715" y1="54" x2="715" y2="280" stroke="#33465f" stroke-dasharray="4 4"/>
+      </g>
+      <g stroke="#4f8cff" stroke-width="1.6" marker-end="url(#ar8)">
+        <line x1="125" y1="80" x2="398" y2="80"/>
+      </g>
+      <text x="255" y="72" class="svg-sub" text-anchor="middle">POST /v1/chat/completions (stream=true)</text>
+      <g stroke="#4f8cff" stroke-width="1.6" marker-end="url(#ar8)">
+        <line x1="410" y1="112" x2="708" y2="112"/>
+      </g>
+      <text x="558" y="104" class="svg-sub" text-anchor="middle">addRequest 入队（注入 onToken 回调）</text>
+      <g stroke="#2dd4bf" stroke-width="1.6" marker-end="url(#ar9)">
+        <line x1="708" y1="148" x2="412" y2="148"/>
+        <line x1="708" y1="180" x2="412" y2="180"/>
+        <line x1="708" y1="212" x2="412" y2="212"/>
+      </g>
+      <text x="558" y="140" class="svg-sub" text-anchor="middle">onToken("你") → SseWriter.write（synchronized）</text>
+      <text x="558" y="172" class="svg-sub" text-anchor="middle">onToken("好") → data: {...delta...}</text>
+      <text x="558" y="204" class="svg-sub" text-anchor="middle">...每 token 一个 SSE chunk...</text>
+      <g stroke="#2dd4bf" stroke-width="1.6" marker-end="url(#ar9)">
+        <line x1="400" y1="148" x2="128" y2="148"/>
+        <line x1="400" y1="180" x2="128" y2="180"/>
+        <line x1="400" y1="212" x2="128" y2="212"/>
+      </g>
+      <g stroke="#f59e0b" stroke-width="1.6" marker-end="url(#ar8)">
+        <line x1="400" y1="248" x2="128" y2="248"/>
+      </g>
+      <text x="262" y="240" class="svg-sub" text-anchor="middle" fill="#fbbf24">handler 轮询 isFinished() 后发结束 chunk + data: [DONE]</text>
+      <text x="715" y="268" class="svg-sub" text-anchor="middle">sweep：释放 KV block</text>
+    </svg>
+    <div class="fig-caption">图 9-1　SSE 流式时序：onToken 回调在引擎线程触发，SseWriter.write 用 synchronized 与 handler 线程协同</div>
+  </div>
+
+  <p style="color:var(--muted);font-size:14px">关键实现点：<code>sendResponseHeaders(200, 0)</code> 启用 chunked 传输无需预知长度；
+  每条消息 <code>data: &lt;json&gt;\n\n</code>；所有 JSON 由零依赖手写的 <code>SimpleJson</code> 处理（<code>LinkedHashMap</code> 保证字段顺序稳定）；
+  请求体限制 1MB。</p>
+</section>
+
+<!-- ═══════════════════ §10 对照 vLLM ═══════════════════ -->
+<section id="vllm">
+  <span class="sec-tag">vs. vLLM</span>
+  <h2>⑩ 与真实 vLLM 的对应关系</h2>
+  <p class="sec-desc">mini-vllm 用「可读的模拟」对应 vLLM 的「高性能实现」，每个对应点都是理解 vLLM 设计的入口。</p>
+  <table>
+    <tr><th>概念</th><th>mini-vllm</th><th>vLLM</th><th>差异说明</th></tr>
+    <tr><td>显存块池</td><td><code>BlockPool</code></td><td>GPU 显存 block 池</td><td>用 Java 堆数组模拟显存</td></tr>
+    <tr><td>页表</td><td><code>BlockTable</code></td><td>per-seq block table</td><td>一致（逻辑→物理映射）</td></tr>
+    <tr><td>分页注意力</td><td><code>Qwen3Attention.decodePaged</code></td><td>PagedAttention CUDA kernel</td><td>Java 逐 block 两遍累加 vs online-softmax 单遍 kernel</td></tr>
+    <tr><td>调度循环</td><td><code>LLMEngine.step</code></td><td>scheduler + worker loop</td><td>单线程串行 vs 多 GPU 并行</td></tr>
+    <tr><td>请求队列</td><td><code>Scheduler</code>（waiting/running）</td><td>vLLM Scheduler</td><td>一致；学习版不做 preemption</td></tr>
+    <tr><td>前缀共享</td><td>block 级哈希指纹（接口就绪未接入）</td><td>RadixAttention 前缀树</td><td>简化映射，极小概率冲突</td></tr>
+    <tr><td>显存不足</td><td>ABORTED（无抢占）</td><td>preemption：swap 到 CPU 或 recompute</td><td>—</td></tr>
+    <tr><td>多模型部署</td><td><code>ModelHub</code> 按 model 字段路由 + 懒加载</td><td>多模型部署与路由</td><td>不做模型换出</td></tr>
+    <tr><td>API server</td><td><code>OpenAiHandler</code>（JDK HttpServer）</td><td>OpenAI-compatible server</td><td>—</td></tr>
+  </table>
+
+  <h3>设计取舍：为什么这样写</h3>
+  <div class="grid-2">
+    <div class="feature"><h4>零外部依赖</h4><p>只用 JDK 标准库（含 com.sun.net.httpserver、jdk.incubator.vector），让代码「可阅读、可改造」，不被框架细节淹没。</p></div>
+    <div class="feature"><h4>CPU 逐 block 模拟</h4><p>牺牲性能换取可读性，让 KV cache 的分页语义清晰可见——教学项目的第一原则。</p></div>
+    <div class="feature"><h4>两套模型并存</h4><p>Qwen3/Llama 提供真实可对话体验，GPT 微模型提供无权重快速验证，降低学习门槛。</p></div>
+    <div class="feature"><h4>单线程调度</h4><p>把 Continuous Batching 的 admit/decode/sweep 三段逻辑摊平在一个 step() 里，一眼看懂。</p></div>
+  </div>
+</section>
+
+<!-- ═══════════════════ §11 测试对齐 ═══════════════════ -->
+<section id="testing">
+  <span class="sec-tag">Testing</span>
+  <h2>⑪ 测试体系：可执行的文档</h2>
+  <p class="sec-desc">推荐「先读测试再读实现」。<code>mvn test</code> 覆盖各层核心逻辑；
+  <code>Qwen3AlignmentTest</code> 是终极验证——加载真实权重，用 Python 脚本从 HF transformers 导出的参考数据逐层比对。</p>
+  <table>
+    <tr><th>想理解</th><th>读这个测试</th></tr>
+    <tr><td>引擎端到端行为（批处理/EOS/流式/采样）</td><td><code>core/LLMEngineE2ETest</code>（8 个场景，含 maxSeqs=2 提交 5 请求全部完成）</td></tr>
+    <tr><td>分页分配与引用计数</td><td><code>memory/BlockPoolTest</code>、<code>KVCacheManagerTest</code></td></tr>
+    <tr><td>RoPE 数值 / Qwen3 前向</td><td><code>model/RotaryEmbeddingTest</code>、<code>Qwen3ModelTest</code></td></tr>
+    <tr><td>BPE 编解码与 HF 一致</td><td><code>tokenizer/BpeTokenizerTest</code></td></tr>
+    <tr><td>mmap 与堆内 bf16 逐位对齐</td><td><code>weights/MmapWeightsTest</code></td></tr>
+    <tr><td><b>与 HF 逐层数值对齐（终极验证）</b></td><td><code>model/Qwen3AlignmentTest</code>（greedy 生成走 PagedAttention 路径，同时验证模型前向与 KV 分页读写）</td></tr>
+  </table>
+  <pre><code>mvn test                                                          # 全量单测
+mvn test -Dtest=Qwen3AlignmentTest -Dqwen3.align=true -DargLine="-Xmx6g"   # HF 对齐（需真实权重）</code></pre>
+</section>
+
+<!-- ═══════════════════ §12 学习路径 ═══════════════════ -->
+<section id="learning">
+  <span class="sec-tag">Learning Path</span>
+  <h2>⑫ 学习路径：从跑起来到改得动</h2>
+  <div class="figure">
+    <svg viewBox="0 0 940 210" width="940" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="学习路线图">
+      <defs><marker id="ar10" markerWidth="9" markerHeight="9" refX="7" refY="3.5" orient="auto"><path d="M0,0 L7,3.5 L0,7 z" fill="#4f8cff"/></marker></defs>
+      <g>
+        <rect x="20"  y="60" width="150" height="70" rx="10" fill="#1c2940" stroke="#4f8cff" stroke-width="1.4"/>
+        <text x="95" y="90" class="svg-label" text-anchor="middle">第 0 步 跑起来</text>
+        <text x="95" y="112" class="svg-sub" text-anchor="middle">编译 + Web 对话一次</text>
+        <rect x="200" y="60" width="150" height="70" rx="10" fill="#1c2940" stroke="#4f8cff" stroke-width="1.4"/>
+        <text x="275" y="90" class="svg-label" text-anchor="middle">第 1 步 全局认知</text>
+        <text x="275" y="112" class="svg-sub" text-anchor="middle">分层 + 数据流 + 线程</text>
+        <rect x="380" y="60" width="150" height="70" rx="10" fill="#241a35" stroke="#8b5cf6" stroke-width="1.4"/>
+        <text x="455" y="90" class="svg-label" text-anchor="middle">第 2 步 核心机制</text>
+        <text x="455" y="112" class="svg-sub" text-anchor="middle">PagedAttn + Batching</text>
+        <rect x="560" y="60" width="150" height="70" rx="10" fill="#241a35" stroke="#8b5cf6" stroke-width="1.4"/>
+        <text x="635" y="90" class="svg-label" text-anchor="middle">第 3 步 模型计算</text>
+        <text x="635" y="112" class="svg-sub" text-anchor="middle">Qwen3 五大特性</text>
+        <rect x="740" y="60" width="180" height="70" rx="10" fill="#123029" stroke="#2dd4bf" stroke-width="1.4"/>
+        <text x="830" y="90" class="svg-label" text-anchor="middle">第 4~5 步 支撑 + 改造</text>
+        <text x="830" y="112" class="svg-sub" text-anchor="middle">KV/权重/API → 动手扩展</text>
+      </g>
+      <g stroke="#4f8cff" stroke-width="1.6" fill="none" marker-end="url(#ar10)">
+        <line x1="170" y1="95" x2="198" y2="95"/>
+        <line x1="350" y1="95" x2="378" y2="95"/>
+        <line x1="530" y1="95" x2="558" y2="95"/>
+        <line x1="710" y1="95" x2="738" y2="95"/>
+      </g>
+      <text x="470" y="170" class="svg-sub" text-anchor="middle">源码自底向上读：math → memory → model → weights → tokenizer → core → api → MiniVllmServer（每个类顶部注释都有「学习要点」）</text>
+    </svg>
+    <div class="fig-caption">图 12-1　五步学习路线</div>
+  </div>
+
+  <h3>挑战级扩展方向（引擎能力补齐）</h3>
+  <ol>
+    <li><b>接入前缀共享</b>：<code>trySharePrefix/registerPrefix</code> 已实现但引擎未使用——改造 admit 逻辑让相同 system prompt 复用 KV block；</li>
+    <li><b>实现 preemption</b>：参考 vLLM 做 swap 到 CPU 或 recompute，让长请求在高压下也能完成；</li>
+    <li><b>batched 前向</b>：把同一 step 的多个请求 Q 拼成矩阵做真正的 batched GEMM；</li>
+    <li><b>支持新模型家族</b>：仿照 <code>Qwen3Family</code>/<code>LlamaFamily</code> 注册新 SPI，复用 math/memory/core 全部层。</li>
+  </ol>
+
+  <h3>常见误区提醒</h3>
+  <ul>
+    <li><b>RoPE 是 half-split 不是交错式</b>——与 HF 对齐时最常见的坑；</li>
+    <li><b>QK-Norm 顺序是 Norm→RoPE</b>，反了数值就不对；</li>
+    <li><b>KVCacheManager 的 dModel 字段实为 kvDim</b>——GQA 下每 token 只存 nKVHead×headDim；</li>
+    <li><b>默认关闭思考模式</b>——否则短请求容易被 max_tokens 截断在推理中途；</li>
+    <li><b>EOS token 不外泄</b>——emitToken 遇停止 token 直接 return，避免 <code>&lt;|im_end|&gt;</code> 污染输出；</li>
+    <li><b>随机模式输出无意义</b>——仅验证流程，真实对话请用 Qwen3/Llama 模型。</li>
+  </ul>
+
+  <h3>延伸阅读</h3>
+  <ul>
+    <li>vLLM 论文：<i>Efficient Memory Management for Large Language Model Serving with PagedAttention</i>（SOSP'23）</li>
+    <li>RoPE 原始论文：<i>RoFormer: Enhanced Transformer with Rotary Position Embedding</i></li>
+    <li>配套 Wiki 文档：本目录下 <code>*.md</code> 共 10 篇，覆盖全部实现细节</li>
+  </ul>
+</section>
+
+</main>
+
+<footer>
+  <div class="container">
+    <p><b>mini-vllm 全景解读</b> · 基于项目当前代码生成 · 配套文档见 <a href="Home.md">wiki/Home.md</a></p>
+    <p>本项目为学习用途。Qwen3 / Llama 模型权重遵循其原始 License。源码入口：<a href="../src/main/java/io/leavesfly/minivllm/MiniVllmServer.java">MiniVllmServer.java</a></p>
+  </div>
+</footer>
+
+</body>
+</html>
